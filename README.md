@@ -105,6 +105,51 @@ curl -s http://localhost:8080/readyz
 # {"checks":{"postgres":"ok","redis":"ok","signing_key":"ok"},"status":"ready"}
 ```
 
+Everyday commands once it's up:
+
+```bash
+docker compose ps                 # status of every service
+docker compose logs -f gateway    # follow the gateway's structured JSON logs
+docker compose down               # stop everything
+docker compose down -v            # stop and also wipe Postgres/Redis data
+```
+
+### Running the Go binaries natively (no Docker image rebuild)
+
+Useful while actually changing code: keep Postgres and Redis in Docker, but run
+the gateway itself with `go run` so edits take effect on the next run without
+a rebuild. Requires Go 1.24+.
+
+```bash
+# Start just the data stores (and the init script that creates the
+# restricted role — see the callout above for why that matters):
+docker compose up -d postgres redis
+
+# Run the gateway against them directly:
+export POSTGRES_DSN="postgres://gateway_app:local-dev-app-password@localhost:5432/gateway?sslmode=disable"
+export REDIS_ADDR="localhost:6379"
+export REDIS_PASSWORD="local-dev-redis-password"
+export BOOTSTRAP_KEY="local-dev-bootstrap-key-0123456789"
+go run ./cmd/gateway
+```
+
+(Those default values come from the `.env` already checked in for local dev —
+adjust if you changed it.) The demo upstream and seed tool run the same way:
+
+```bash
+go run ./cmd/upstream                       # demo backend on :8090
+go run ./cmd/seed -slug=acme -name="Acme"   # bootstrap a tenant directly in the DB
+```
+
+Or compile binaries instead of `go run`-ing them:
+
+```bash
+go build -o bin/gateway  ./cmd/gateway
+go build -o bin/seed     ./cmd/seed
+go build -o bin/upstream ./cmd/upstream
+./bin/gateway   # same env vars as above
+```
+
 ## Seeing it work
 
 Two ways, from easiest to most hands-on:
