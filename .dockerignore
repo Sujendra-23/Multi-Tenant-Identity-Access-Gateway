@@ -1,0 +1,9 @@
+.git
+.github
+.rocketride
+.claude
+deploy
+*.md
+.env
+.env.example
+scratchpad

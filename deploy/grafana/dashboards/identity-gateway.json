@@ -1,0 +1,82 @@
+{
+  "title": "Identity Gateway",
+  "uid": "identity-gateway",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "title": "Request rate by status class", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [{ "expr": "sum by (status) (rate(gateway_http_requests_total[1m]))", "legendFormat": "{{status}}" }]
+    },
+    {
+      "id": 2, "title": "P50 / P95 / P99 request latency", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(gateway_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(gateway_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 3, "title": "Authentication attempts by outcome", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [{ "expr": "sum by (outcome) (rate(gateway_auth_attempts_total[5m]))", "legendFormat": "{{outcome}}" }]
+    },
+    {
+      "id": 4, "title": "Refresh-token reuse detections (should be ~0)", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [{ "expr": "sum(rate(gateway_token_refresh_total{outcome=\"reuse_detected\"}[5m]))", "legendFormat": "reuse detected" }],
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "red" } }, "overrides": [] }
+    },
+    {
+      "id": 5, "title": "Authorization decisions", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [{ "expr": "sum by (decision, reason) (rate(gateway_authz_decisions_total[5m]))", "legendFormat": "{{decision}} / {{reason}}" }]
+    },
+    {
+      "id": 6, "title": "Permission cache hit rate", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [{ "expr": "sum by (result) (rate(gateway_policy_cache_ops_total[5m]))", "legendFormat": "{{result}}" }]
+    },
+    {
+      "id": 7, "title": "Risk score distribution", "type": "heatmap",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "targets": [{ "expr": "sum by (le) (rate(gateway_request_risk_score_bucket[5m]))", "format": "heatmap", "legendFormat": "{{le}}" }]
+    },
+    {
+      "id": 8, "title": "Rate limit rejections by dimension", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "targets": [{ "expr": "sum by (dimension) (rate(gateway_rate_limit_rejections_total[5m]))", "legendFormat": "{{dimension}}" }]
+    },
+    {
+      "id": 9, "title": "Active sessions by tenant", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 32 },
+      "targets": [{ "expr": "gateway_active_sessions", "legendFormat": "{{tenant}}" }]
+    },
+    {
+      "id": 10, "title": "Audit buffer depth", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 32 },
+      "targets": [{ "expr": "gateway_audit_buffer_depth", "legendFormat": "buffered" }]
+    },
+    {
+      "id": 11, "title": "Audit events dropped (should be 0)", "type": "stat",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 32 },
+      "targets": [{ "expr": "gateway_audit_events_dropped_total", "legendFormat": "dropped" }],
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } }, "overrides": [] }
+    },
+    {
+      "id": 12, "title": "Trusted signing keys", "type": "stat",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "targets": [{ "expr": "gateway_signing_keys", "legendFormat": "keys" }]
+    },
+    {
+      "id": 13, "title": "In-flight requests", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "targets": [{ "expr": "gateway_http_in_flight_requests", "legendFormat": "in-flight" }]
+    }
+  ]
+}

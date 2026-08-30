@@ -1,0 +1,18 @@
+# Local docker-compose scrape config. In Kubernetes this is replaced by a
+# ServiceMonitor (see deploy/k8s/servicemonitor.yaml) if the Prometheus
+# Operator is in use, or an equivalent scrape_config pointed at the gateway's
+# ClusterIP service on the metrics port.
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: identity-gateway
+    static_configs:
+      - targets: ["gateway:9090"]
+        labels:
+          service: identity-gateway
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

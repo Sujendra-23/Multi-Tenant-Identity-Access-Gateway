@@ -1,0 +1,56 @@
+# Stand-in for a real backend service behind the gateway. See cmd/upstream for
+# what it demonstrates: independent JWT verification via the gateway's JWKS,
+# on top of (not instead of) the network isolation below.
+apiVersion: v1
+kind: Service
+metadata:
+  name: upstream
+  namespace: identity-gateway
+spec:
+  selector: { app: upstream }
+  ports: [{ port: 8090, targetPort: 8090 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: upstream
+  namespace: identity-gateway
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: upstream } }
+  template:
+    metadata:
+      labels: { app: upstream }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        # The distroless nonroot base image (see Dockerfile) sets USER
+        # nonroot:nonroot, a name rather than a bare digit in the image's own
+        # config. Some kubelet versions cannot resolve that name to verify
+        # runAsNonRoot on their own and fail the pod outright ("cannot verify
+        # user is non-root") rather than assume — so the UID distroless
+        # documents for "nonroot" (65532) is pinned explicitly here instead of
+        # relying on the image default being resolvable.
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: upstream
+          image: identity-gateway-upstream:latest
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 8090 }]
+          env:
+            - name: ADDR
+              value: ":8090"
+            - name: GATEWAY_JWKS_URL
+              value: "http://gateway:8080/.well-known/jwks.json"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8090 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits: { cpu: "250m", memory: "128Mi" }

@@ -1,0 +1,8 @@
+.rocketride/
+.env
+/bin/
+*.log
+.DS_Store
+/gateway
+/upstream
+/seed

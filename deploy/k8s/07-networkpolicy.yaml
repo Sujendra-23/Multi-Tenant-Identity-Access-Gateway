@@ -1,0 +1,69 @@
+# Enforces the network-boundary half of the trust the upstream service
+# describes in its own header comment (cmd/upstream/main.go): the X-Gateway-*
+# identity headers it receives are only meaningful if nothing but the gateway
+# can reach it directly. Without this, any other pod in the cluster could call
+# the upstream, forge those headers itself, and skip authentication and
+# authorization entirely — the upstream has no way to tell the difference on
+# its own. This is why cmd/upstream ALSO verifies the forwarded JWT
+# independently via JWKS: that check holds even if this policy is ever
+# misconfigured or the CNI does not enforce NetworkPolicy at all.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: upstream-only-from-gateway
+  namespace: identity-gateway
+spec:
+  podSelector:
+    matchLabels: { app: upstream }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: gateway } }
+      ports:
+        - { protocol: TCP, port: 8090 }
+---
+# Postgres and Redis accept connections only from the gateway. Nothing else in
+# the namespace (or cluster, depending on your CNI's default-deny posture) has
+# any business reaching the data stores directly.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-only-from-gateway
+  namespace: identity-gateway
+spec:
+  podSelector: { matchLabels: { app: postgres } }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from: [{ podSelector: { matchLabels: { app: gateway } } }]
+      ports: [{ protocol: TCP, port: 5432 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-only-from-gateway
+  namespace: identity-gateway
+spec:
+  podSelector: { matchLabels: { app: redis } }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from: [{ podSelector: { matchLabels: { app: gateway } } }]
+      ports: [{ protocol: TCP, port: 6379 }]
+---
+# Prometheus needs the metrics port only, never the tenant-facing API port.
+# Adjust the namespaceSelector to match whatever labels your Prometheus
+# actually runs under (this assumes the common `kubernetes.io/metadata.name`
+# convention naming the "monitoring" namespace).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-metrics-from-monitoring
+  namespace: identity-gateway
+spec:
+  podSelector: { matchLabels: { app: gateway } }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: monitoring } }
+      ports: [{ protocol: TCP, port: 9090 }]
+    - from: [] # the tenant-facing port stays reachable per your Ingress/Service setup
+      ports: [{ protocol: TCP, port: 8080 }]

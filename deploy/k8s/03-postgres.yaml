@@ -1,0 +1,71 @@
+# A single-replica Postgres for demonstration/local-cluster purposes. A real
+# deployment should use a managed database (RDS, Cloud SQL) or an operator
+# (CloudNativePG, Zalando's postgres-operator) for replication, backups and
+# failover — a bare StatefulSet like this one has none of that.
+#
+# The postgres-init-scripts ConfigMap this StatefulSet mounts is deliberately
+# NOT defined here as static YAML: its content is deploy/postgres-init/01-app-role.sh,
+# the exact same file docker-compose bind-mounts locally. Duplicating that
+# script's content into this file would mean two copies to keep in sync, and
+# specifically the one file where a silent drift would be hardest to notice —
+# it is what stands between this deployment and the RLS-bypass misconfiguration
+# documented in that script's own comments. scripts/k8s-deploy.sh generates the
+# ConfigMap from the real file with `kubectl create configmap ... --from-file`;
+# run that (or the equivalent single command) before applying this manifest.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: identity-gateway
+spec:
+  selector: { app: postgres }
+  ports:
+    - port: 5432
+      targetPort: 5432
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: identity-gateway
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector: { matchLabels: { app: postgres } }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports: [{ containerPort: 5432 }]
+          envFrom:
+            - secretRef: { name: identity-gateway-secrets }
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+              subPath: pgdata
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "$(POSTGRES_USER)", "-d", "$(POSTGRES_DB)"] }
+            periodSeconds: 5
+          livenessProbe:
+            exec: { command: ["pg_isready", "-U", "$(POSTGRES_USER)", "-d", "$(POSTGRES_DB)"] }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "250m", memory: "256Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+      volumes:
+        - name: init-scripts
+          configMap:
+            name: postgres-init-scripts
+            defaultMode: 0755
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 10Gi } }
