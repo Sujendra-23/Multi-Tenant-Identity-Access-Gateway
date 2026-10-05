@@ -73,6 +73,7 @@ func TestValidate_RejectsEmptyStoreAddresses(t *testing.T) {
 		AccessTokenTTL: time.Minute, RefreshTokenTTL: time.Hour,
 		RiskStepUpThreshold: 50, RiskDenyThreshold: 80,
 		PostgresDSN: "", RedisAddr: "localhost:6379",
+		FeatureFlagsBackend: "file", FeatureFlagsSyncInterval: 5 * time.Second,
 	}
 	if err := c.validate(); err == nil {
 		t.Fatal("expected an error for an empty PostgresDSN")
@@ -100,5 +101,32 @@ func TestIsProduction(t *testing.T) {
 	c.Env = "development"
 	if c.IsProduction() {
 		t.Error("Env=development should report IsProduction() == false")
+	}
+}
+
+func TestFeatureFlagsConfiguration(t *testing.T) {
+	for _, backend := range []string{"file", "redis"} {
+		t.Run(backend, func(t *testing.T) {
+			t.Setenv("FEATURE_FLAGS_BACKEND", backend)
+			t.Setenv("FEATURE_FLAGS_SYNC_INTERVAL", "2s")
+			c, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.FeatureFlagsBackend != backend || c.FeatureFlagsSyncInterval != 2*time.Second {
+				t.Fatal("flag configuration not loaded")
+			}
+		})
+	}
+	t.Setenv("FEATURE_FLAGS_BACKEND", "typo")
+	if _, err := Load(); err == nil {
+		t.Fatal("accepted unknown backend")
+	}
+	t.Setenv("FEATURE_FLAGS_BACKEND", "redis")
+	for _, interval := range []string{"0s", "-1s", "invalid"} {
+		t.Setenv("FEATURE_FLAGS_SYNC_INTERVAL", interval)
+		if _, err := Load(); err == nil {
+			t.Fatal("accepted nonpositive reconciliation interval")
+		}
 	}
 }

@@ -30,14 +30,14 @@ func NewTenantAdminHandler(tenants *postgres.TenantRepo, roles *postgres.RoleRep
 	return &TenantAdminHandler{tenants: tenants, roles: roles, users: users, auditor: auditor, bootstrapKey: bootstrapKey, log: log}
 }
 
-// RequireBootstrapKey guards the tenant-admin routes with a static shared
+// RequireBootstrapKey guards the operator-admin routes with a static shared
 // secret from configuration (X-Bootstrap-Key), checked in constant time.
 // This key belongs to whoever operates the gateway, not to any tenant, and
 // should be rotated the same way any other root credential would be.
 func (h *TenantAdminHandler) RequireBootstrapKey(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if h.bootstrapKey == "" {
-			writeError(w, r, http.StatusServiceUnavailable, "bootstrap_disabled", "tenant administration is not configured on this deployment")
+			writeError(w, r, http.StatusServiceUnavailable, "bootstrap_disabled", "operator administration is not configured on this deployment")
 			return
 		}
 		given := r.Header.Get("X-Bootstrap-Key")

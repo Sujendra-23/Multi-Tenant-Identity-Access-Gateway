@@ -1,7 +1,10 @@
 # Single-instance Redis for demonstration purposes. Losing this loses every
 # live session, refresh token and rate-limit bucket — inconvenient (every user
 # has to log in again) but not a correctness problem, since Postgres remains
-# the source of truth for everything durable. A real deployment should run
+# the source of truth for tenant data. In FEATURE_FLAGS_BACKEND=redis mode,
+# losing this keyspace also loses the shared flag configuration; emptyDir does
+# not survive pod replacement. Use persistent storage/backups for shared flags.
+# A real deployment should run
 # Redis with replication/Sentinel or use a managed equivalent (ElastiCache,
 # MemoryStore) for availability.
 apiVersion: v1

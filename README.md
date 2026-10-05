@@ -33,7 +33,7 @@ stack to watch it happen.
 | JWT session management with token rotation | Ed25519-signed access tokens with automatic key rotation (`internal/auth/keyring.go`), opaque single-use refresh tokens with atomic rotation and replay detection (`internal/store/redisstore/sessions.go`). |
 | Zero-trust request verification | Every authenticated request re-checks token liveness, tenant match, policy currency, and a continuous risk score — not just signature validity. `internal/httpapi/middleware/auth.go`, `internal/authz/risk.go`. |
 | Rate limiting + audit logging per tenant | Layered token-bucket limits (IP → user → tenant → login) in Redis (`internal/store/redisstore/ratelimit.go`); an append-only, hash-chained, tamper-evident audit log per tenant (`internal/store/postgres/audit.go`). |
-| Hot-reloadable tenant feature flags | Proxy rollout controls with global defaults and tenant overrides; validated JSON snapshots atomically reloaded on `SIGHUP` (`internal/featureflags/`). |
+| Hot-reloadable tenant feature flags | Stable percentage rollouts and tenant overrides; local `SIGHUP` reloads or revision-checked admin updates propagated through Redis pub/sub with periodic reconciliation (`internal/featureflags/`). |
 | Kubernetes/EKS | Full manifest set in `deploy/k8s/`, validated end-to-end against a real cluster (see [Kubernetes](#kubernetes)). |
 | Prometheus/Grafana | `internal/observability/`, dashboard at `deploy/grafana/dashboards/identity-gateway.json`. |
 
@@ -385,7 +385,7 @@ this stays true.
 ## API reference
 
 All routes except `/healthz`, `/readyz`, `/.well-known/jwks.json`, and
-`/v1/admin/tenants` require `X-Tenant: <slug>`. Routes under the second
+`/v1/admin/tenants` / `/v1/admin/feature-flags` require `X-Tenant: <slug>`. Routes under the second
 `/v1` group additionally require `Authorization: Bearer <access_token>`.
 
 | Method | Path | Auth | Purpose |
@@ -394,6 +394,8 @@ All routes except `/healthz`, `/readyz`, `/.well-known/jwks.json`, and
 | GET | `/.well-known/jwks.json` | none | Public keys for independent JWT verification. |
 | POST | `/v1/admin/tenants` | `X-Bootstrap-Key` | Provision a tenant + owner user + default roles. |
 | GET | `/v1/admin/tenants` | `X-Bootstrap-Key` | List tenants. |
+| GET | `/v1/admin/feature-flags` | `X-Bootstrap-Key` | Read shared flags and their ETag (Redis mode only). |
+| PUT | `/v1/admin/feature-flags` | `X-Bootstrap-Key` + `If-Match` | Replace the shared snapshot and notify replicas (Redis mode only). |
 | POST | `/v1/auth/login` | tenant only | Credential exchange → token pair. |
 | POST | `/v1/auth/refresh` | tenant only | Rotate a refresh token. |
 | POST | `/v1/auth/logout` | bearer | Revoke the current session immediately. |
@@ -428,12 +430,15 @@ deployments should review at least these:
 | `MAX_FAILED_LOGINS`, `LOCKOUT_DURATION` | `5`, `15m` | |
 | `TRUSTED_PROXY_CIDRS` | RFC1918 ranges | Only trust `X-Forwarded-For` from these peers. |
 | `BOOTSTRAP_KEY` | — | Gates tenant provisioning; treat as a root credential. |
-| `FEATURE_FLAGS_FILE` | unset | Optional JSON proxy flags; reload with `SIGHUP`. See below. |
+| `FEATURE_FLAGS_BACKEND` | `file` | `file` for local reloads; `redis` for shared snapshots and the admin API. |
+| `FEATURE_FLAGS_FILE` | unset | Local JSON proxy flags, or a first-start seed in Redis mode. |
+| `FEATURE_FLAGS_REDIS_KEY` | `identity-gateway:feature-flags` | Shared Redis key; use a unique namespace per deployment. |
+| `FEATURE_FLAGS_SYNC_INTERVAL` | `5s` | Positive reconciliation interval; repairs missed pub/sub notifications. |
 | `UPSTREAMS` | — | `name=url,name2=url2` — backends the proxy can reach. |
 
 ### Hot-reloadable proxy feature flags
 
-Set `FEATURE_FLAGS_FILE` to a JSON file before starting the gateway. If unset,
+With the default `FEATURE_FLAGS_BACKEND=file`, set `FEATURE_FLAGS_FILE` to a JSON file before starting the gateway. If unset,
 proxy access keeps its existing behavior. If set, an unreadable or invalid file
 prevents startup. For example:
 
@@ -491,7 +496,7 @@ docker compose kill -s SIGHUP gateway
 ```
 
 When using `go run`, signal the compiled gateway child process, not the Go
-launcher. Only send `SIGHUP` when `FEATURE_FLAGS_FILE` is configured.
+launcher. Only send `SIGHUP` in file mode when `FEATURE_FLAGS_FILE` is configured.
 The supplied Compose/Kubernetes manifests do not mount this optional file.
 Mount its parent directory rather than a single file so atomic replacements
 remain visible inside the container.
@@ -499,9 +504,87 @@ remain visible inside the container.
 Each request reads one immutable snapshot. Invalid reloads retain the last
 valid snapshot and emit an error log; successful reloads emit an info log.
 Already-forwarded requests finish normally. This reloads only proxy feature
-flags, not environment settings or upstream URLs. For multiple replicas,
-distribute the file and signal each process; there is no coordinated rollout
-service or management API. Restrict file write access to trusted operators.
+flags, not environment settings or upstream URLs. In file mode, distribute the
+file and signal each process yourself. Restrict file write access to trusted
+operators. For automatic propagation, use Redis mode below.
+
+### Shared flag updates across replicas
+
+Set `FEATURE_FLAGS_BACKEND=redis` on every gateway replica, using the same
+Redis database and `FEATURE_FLAGS_REDIS_KEY`. Compose passes these settings
+from `.env`; Kubernetes exposes them in `deploy/k8s/02-configmap.yaml`.
+Both manifests retain file mode by default. Restart the gateways once after
+changing the backend; subsequent flag updates use the API without restarts.
+
+At startup, the first replica seeds a missing Redis key atomically from
+`FEATURE_FLAGS_FILE`, or from `{"proxy_enabled":true}` if no file is supplied.
+Other replicas load the existing shared snapshot before serving traffic.
+A seed file never overwrites existing shared state. Supply the same seed on
+all replicas; concurrent first starts use whichever seed wins `SETNX`.
+Unreadable/invalid configured seed files and unavailable/invalid shared state
+prevent startup. In Redis mode, `SIGHUP` is not a reload mechanism: use the API.
+
+The API is a global operator surface protected by the existing
+`X-Bootstrap-Key` secret and per-IP rate limiter. Tenant bearer tokens do not
+grant access, and an unset bootstrap key disables administration. Use HTTPS
+outside local development and keep this credential with trusted operators.
+For example, with `BOOTSTRAP_KEY` already exported in your shell:
+
+```bash
+# Read the authoritative snapshot and its opaque revision (requires jq).
+revision=$(curl -fsS http://localhost:8080/v1/admin/feature-flags \
+  -H "X-Bootstrap-Key: $BOOTSTRAP_KEY" | jq -r '.revision')
+
+# Replace the entire configuration with a 10% rollout.
+curl -fsS -X PUT http://localhost:8080/v1/admin/feature-flags \
+  -H "X-Bootstrap-Key: $BOOTSTRAP_KEY" \
+  -H "If-Match: \"$revision\"" \
+  -H "Content-Type: application/json" \
+  -d '{"proxy_enabled":true,"rollout_percent":10,"tenants":{}}'
+```
+
+GET and successful PUT return `{"revision":"<uuid>","flags":{...}}` and a
+quoted `ETag` header. PUT requires that ETag in `If-Match`: missing revisions
+return `428`, stale revisions `412`, malformed revisions or flags `400`, and
+bodies over one MiB `413`. Redis failures return `503`. A network error can
+leave the write outcome uncertain; read the current snapshot before retrying.
+To advance to 100% or roll back, GET the latest revision and PUT the complete
+desired configuration. Omitted tenant overrides are removed.
+
+Each accepted update checks the revision, writes the snapshot without expiry,
+and publishes a notification in one Redis Lua script. The handling replica
+applies it locally; other replicas fetch the shared key on notification.
+Notifications carry only a revision, and replicas never apply their payload
+as configuration. Polling every `FEATURE_FLAGS_SYNC_INTERVAL` (default five
+seconds) repairs missed notifications and reconnect gaps. A restarted replica
+loads the persisted snapshot. Applied revisions and operator changes are
+logged without credentials or full flag contents.
+
+Propagation is **eventually consistent**, not a simultaneous all-replica
+switch: HTTP success confirms the shared write and the handling replica's
+update, not acknowledgements from every replica. Failed reads and invalid
+snapshots retain the last valid local flags and log an error; new shared-mode
+processes refuse to start when Redis is unavailable. Already-forwarded
+requests finish normally. File mode and Redis mode are separate sources;
+file-mode replicas will not receive shared updates.
+
+Redis persistence determines whether flags survive Redis data loss. Compose
+uses an AOF-backed volume; the demo Kubernetes Redis uses `emptyDir`, which
+is lost on pod replacement. Use persistent Redis storage and backups before
+relying on shared flags there. Deleting/evicting the key makes running replicas
+retain their last snapshot and reject admin writes; a subsequent gateway
+startup seeds an absent key again. Restore the saved configuration before
+restarting gateways if the default seed would be inappropriate.
+
+The Redis integration tests exercise two independent replicas, concurrent
+revision conflicts, restart loading, missed notifications, reconnects, and an
+HTTP admin update changing another replica's proxy behavior:
+
+```bash
+# Use a scratch Redis instance. Run separately from redisstore tests, which FLUSHDB.
+REDIS_TEST_ADDR=localhost:16389 go test -race ./internal/featureflags ./internal/httpapi/handlers
+```
+
 
 ## Design decisions and trade-offs
 
@@ -576,7 +659,8 @@ credible:
   an operator (see comments in `deploy/k8s/03-postgres.yaml`) and Redis
   replication/Sentinel — losing Redis loses every live session (inconvenient:
   re-login) but not correctness, since Postgres remains the durable source of
-  truth for everything except in-flight sessions.
+  truth for tenant data. Redis-backed feature flags also need persistent
+  Redis storage and backups; see the shared flag section above.
 - **`NetworkPolicy` enforcement wasn't validated against real traffic** — see
   the Kubernetes section above. The policies are syntactically correct and
   accepted by the API server; proving they actually block traffic needs a
@@ -604,6 +688,7 @@ cmd/
 internal/
   domain/     Core entities and sentinel errors — no I/O.
   config/     Environment-driven config with validation.
+  featureflags/  Percentage evaluation, file reloads, Redis snapshots and propagation.
   auth/       Password hashing, JWT keyring + rotation, the login/refresh/
               step-up service.
   authz/      RBAC evaluation and the continuous risk-scoring engine.

@@ -63,6 +63,9 @@ services:
       JWT_ISSUER: ${JWT_ISSUER}
       JWT_AUDIENCE: ${JWT_AUDIENCE}
       BOOTSTRAP_KEY: ${BOOTSTRAP_KEY}
+      FEATURE_FLAGS_BACKEND: ${FEATURE_FLAGS_BACKEND:-file}
+      FEATURE_FLAGS_REDIS_KEY: ${FEATURE_FLAGS_REDIS_KEY:-identity-gateway:feature-flags}
+      FEATURE_FLAGS_SYNC_INTERVAL: ${FEATURE_FLAGS_SYNC_INTERVAL:-5s}
       UPSTREAMS: "demo=http://upstream:8090"
       # The immediate peer inside the compose network is always another
       # container, never a public client, so X-Forwarded-For from that peer is

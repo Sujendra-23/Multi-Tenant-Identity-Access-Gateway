@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -161,5 +162,16 @@ func TestRolloutStableHashAndFlagNames(t *testing.T) {
 	// Fixed vectors lock the hash algorithm and encoding across future versions.
 	if !rolloutEnabled("tenant-0", "proxy_enabled", 70) || rolloutEnabled("tenant-0", "proxy_enabled", 69) {
 		t.Fatal("stable bucket changed")
+	}
+}
+
+func TestConfigurationSizeLimit(t *testing.T) {
+	for _, body := range []string{
+		`{"proxy_enabled":true}` + strings.Repeat(" ", MaxConfigBytes),
+		`{"proxy_enabled":true,"tenants":{"` + strings.Repeat("<", MaxConfigBytes/2) + `":true}}`,
+	} {
+		if _, err := parse([]byte(body)); err == nil {
+			t.Fatal("accepted oversized wire or persisted configuration")
+		}
 	}
 }

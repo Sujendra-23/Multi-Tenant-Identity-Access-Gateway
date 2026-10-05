@@ -25,18 +25,19 @@ import (
 
 // Deps bundles everything the router needs to build handlers and middleware.
 type Deps struct {
-	Flags      *featureflags.Flags
-	Config     *config.Config
-	Log        *slog.Logger
-	Metrics    *observability.Metrics
-	DB         *postgres.DB
-	Cache      *redisstore.Client
-	Keyring    *auth.Keyring
-	Issuer     *auth.TokenIssuer
-	AuthSvc    *auth.Service
-	Evaluator  *authz.Evaluator
-	RiskEngine *authz.RiskEngine
-	Auditor    *audit.Logger
+	Flags            *featureflags.Flags
+	DistributedFlags *featureflags.Distributed
+	Config           *config.Config
+	Log              *slog.Logger
+	Metrics          *observability.Metrics
+	DB               *postgres.DB
+	Cache            *redisstore.Client
+	Keyring          *auth.Keyring
+	Issuer           *auth.TokenIssuer
+	AuthSvc          *auth.Service
+	Evaluator        *authz.Evaluator
+	RiskEngine       *authz.RiskEngine
+	Auditor          *audit.Logger
 
 	Tenants  *postgres.TenantRepo
 	Users    *postgres.UserRepo
@@ -103,6 +104,15 @@ func NewRouter(d Deps) http.Handler {
 		r.Post("/", tenantAdmin.Create)
 		r.Get("/", tenantAdmin.List)
 	})
+
+	if d.DistributedFlags != nil {
+		flagAdmin := handlers.NewFeatureFlagsHandler(d.DistributedFlags, d.Log)
+		r.Route("/v1/admin/feature-flags", func(r chi.Router) {
+			r.Use(tenantAdmin.RequireBootstrapKey)
+			r.Get("/", flagAdmin.Get)
+			r.Put("/", flagAdmin.Put)
+		})
+	}
 
 	authHandler := handlers.NewAuthHandler(d.AuthSvc, d.Issuer, d.Log)
 	userHandler := handlers.NewUserHandler(d.Users, d.AuthSvc, d.Auditor, d.Log)

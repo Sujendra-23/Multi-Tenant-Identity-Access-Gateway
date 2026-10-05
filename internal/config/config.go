@@ -23,6 +23,11 @@ type Config struct {
 	RedisPass   string
 	RedisDB     int
 
+	FeatureFlagsBackend      string
+	FeatureFlagsFile         string
+	FeatureFlagsRedisKey     string
+	FeatureFlagsSyncInterval time.Duration
+
 	// Token lifetimes. Access tokens are deliberately short: the gateway
 	// re-verifies on every request, so a short TTL bounds the blast radius of a
 	// leaked token without costing us a database round trip per call.
@@ -73,43 +78,61 @@ type Config struct {
 
 func Load() (*Config, error) {
 	c := &Config{
-		Env:                 env("ENV", "development"),
-		HTTPAddr:            env("HTTP_ADDR", ":8080"),
-		MetricsAddr:         env("METRICS_ADDR", ":9090"),
-		PostgresDSN:         env("POSTGRES_DSN", "postgres://gateway:gateway@localhost:5432/gateway?sslmode=disable"),
-		RedisAddr:           env("REDIS_ADDR", "localhost:6379"),
-		RedisPass:           env("REDIS_PASSWORD", ""),
-		RedisDB:             envInt("REDIS_DB", 0),
-		AccessTokenTTL:      envDur("ACCESS_TOKEN_TTL", 5*time.Minute),
-		RefreshTokenTTL:     envDur("REFRESH_TOKEN_TTL", 720*time.Hour),
-		Issuer:              env("JWT_ISSUER", "https://gateway.local"),
-		Audience:            env("JWT_AUDIENCE", "identity-gateway"),
-		SigningKeyMaxAge:    envDur("SIGNING_KEY_MAX_AGE", 24*time.Hour),
-		BindTokensToIP:      envBool("BIND_TOKENS_TO_IP", true),
-		BindTokensToDevice:  envBool("BIND_TOKENS_TO_DEVICE", true),
-		RiskDenyThreshold:   envInt("RISK_DENY_THRESHOLD", 80),
-		RiskStepUpThreshold: envInt("RISK_STEPUP_THRESHOLD", 50),
-		IPRateLimit:         envInt("IP_RATE_LIMIT", 50),
-		IPRateBurst:         envInt("IP_RATE_BURST", 100),
-		UserRateLimit:       envInt("USER_RATE_LIMIT", 20),
-		UserRateBurst:       envInt("USER_RATE_BURST", 40),
-		TenantRateLimit:     envInt("TENANT_RATE_LIMIT", 200),
-		TenantRateBurst:     envInt("TENANT_RATE_BURST", 400),
-		LoginRateLimit:      envInt("LOGIN_RATE_LIMIT", 1),
-		LoginRateBurst:      envInt("LOGIN_RATE_BURST", 5),
-		MaxFailedLogins:     envInt("MAX_FAILED_LOGINS", 5),
-		LockoutDuration:     envDur("LOCKOUT_DURATION", 15*time.Minute),
-		AuditBufferSize:     envInt("AUDIT_BUFFER_SIZE", 4096),
-		AuditBatchSize:      envInt("AUDIT_BATCH_SIZE", 128),
-		AuditFlushEvery:     envDur("AUDIT_FLUSH_INTERVAL", 2*time.Second),
-		MaxTenantLabels:     envInt("MAX_TENANT_LABELS", 50),
-		ShutdownTimeout:     envDur("SHUTDOWN_TIMEOUT", 20*time.Second),
-		Upstreams:           parseUpstreams(env("UPSTREAMS", "demo=http://localhost:8090")),
+		Env:                      env("ENV", "development"),
+		HTTPAddr:                 env("HTTP_ADDR", ":8080"),
+		MetricsAddr:              env("METRICS_ADDR", ":9090"),
+		PostgresDSN:              env("POSTGRES_DSN", "postgres://gateway:gateway@localhost:5432/gateway?sslmode=disable"),
+		RedisAddr:                env("REDIS_ADDR", "localhost:6379"),
+		RedisPass:                env("REDIS_PASSWORD", ""),
+		RedisDB:                  envInt("REDIS_DB", 0),
+		FeatureFlagsBackend:      env("FEATURE_FLAGS_BACKEND", "file"),
+		FeatureFlagsFile:         env("FEATURE_FLAGS_FILE", ""),
+		FeatureFlagsRedisKey:     env("FEATURE_FLAGS_REDIS_KEY", "identity-gateway:feature-flags"),
+		FeatureFlagsSyncInterval: 5 * time.Second,
+		AccessTokenTTL:           envDur("ACCESS_TOKEN_TTL", 5*time.Minute),
+		RefreshTokenTTL:          envDur("REFRESH_TOKEN_TTL", 720*time.Hour),
+		Issuer:                   env("JWT_ISSUER", "https://gateway.local"),
+		Audience:                 env("JWT_AUDIENCE", "identity-gateway"),
+		SigningKeyMaxAge:         envDur("SIGNING_KEY_MAX_AGE", 24*time.Hour),
+		BindTokensToIP:           envBool("BIND_TOKENS_TO_IP", true),
+		BindTokensToDevice:       envBool("BIND_TOKENS_TO_DEVICE", true),
+		RiskDenyThreshold:        envInt("RISK_DENY_THRESHOLD", 80),
+		RiskStepUpThreshold:      envInt("RISK_STEPUP_THRESHOLD", 50),
+		IPRateLimit:              envInt("IP_RATE_LIMIT", 50),
+		IPRateBurst:              envInt("IP_RATE_BURST", 100),
+		UserRateLimit:            envInt("USER_RATE_LIMIT", 20),
+		UserRateBurst:            envInt("USER_RATE_BURST", 40),
+		TenantRateLimit:          envInt("TENANT_RATE_LIMIT", 200),
+		TenantRateBurst:          envInt("TENANT_RATE_BURST", 400),
+		LoginRateLimit:           envInt("LOGIN_RATE_LIMIT", 1),
+		LoginRateBurst:           envInt("LOGIN_RATE_BURST", 5),
+		MaxFailedLogins:          envInt("MAX_FAILED_LOGINS", 5),
+		LockoutDuration:          envDur("LOCKOUT_DURATION", 15*time.Minute),
+		AuditBufferSize:          envInt("AUDIT_BUFFER_SIZE", 4096),
+		AuditBatchSize:           envInt("AUDIT_BATCH_SIZE", 128),
+		AuditFlushEvery:          envDur("AUDIT_FLUSH_INTERVAL", 2*time.Second),
+		MaxTenantLabels:          envInt("MAX_TENANT_LABELS", 50),
+		ShutdownTimeout:          envDur("SHUTDOWN_TIMEOUT", 20*time.Second),
+		Upstreams:                parseUpstreams(env("UPSTREAMS", "demo=http://localhost:8090")),
+	}
+	if raw := os.Getenv("FEATURE_FLAGS_SYNC_INTERVAL"); raw != "" {
+		interval, err := time.ParseDuration(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid FEATURE_FLAGS_SYNC_INTERVAL: %w", err)
+		}
+		c.FeatureFlagsSyncInterval = interval
 	}
 	return c, c.validate()
 }
 
 func (c *Config) validate() error {
+	if c.FeatureFlagsBackend != "file" && c.FeatureFlagsBackend != "redis" {
+		return fmt.Errorf("FEATURE_FLAGS_BACKEND must be file or redis")
+	}
+	if c.FeatureFlagsSyncInterval <= 0 {
+		return fmt.Errorf("FEATURE_FLAGS_SYNC_INTERVAL must be positive")
+	}
+
 	if c.AccessTokenTTL <= 0 || c.AccessTokenTTL > time.Hour {
 		return fmt.Errorf("ACCESS_TOKEN_TTL must be in (0, 1h]; got %s", c.AccessTokenTTL)
 	}

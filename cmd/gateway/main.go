@@ -97,11 +97,13 @@ func run() error {
 	defer stop()
 
 	flags := &featureflags.Flags{}
-	flagsPath := os.Getenv("FEATURE_FLAGS_FILE")
+	flagsPath := cfg.FeatureFlagsFile
 	if flagsPath != "" {
 		if err := flags.Reload(flagsPath); err != nil {
 			return fmt.Errorf("load feature flags: %w", err)
 		}
+	}
+	if flagsPath != "" && cfg.FeatureFlagsBackend == "file" {
 		reload := make(chan os.Signal, 1)
 		signal.Notify(reload, syscall.SIGHUP)
 		defer signal.Stop(reload)
@@ -147,6 +149,21 @@ func run() error {
 	}
 	defer cache.Close()
 
+	var distributedFlags *featureflags.Distributed
+	if cfg.FeatureFlagsBackend == "redis" {
+		distributedFlags = featureflags.NewDistributed(cache.Raw(), flags, cfg.FeatureFlagsRedisKey, cfg.FeatureFlagsSyncInterval, log)
+		initCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := distributedFlags.Initialize(initCtx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("initialize shared feature flags: %w", err)
+		}
+		flagCtx, stopFlags := context.WithCancel(ctx)
+		flagDone := make(chan struct{})
+		go func() { defer close(flagDone); distributedFlags.Run(flagCtx) }()
+		defer func() { stopFlags(); <-flagDone }()
+	}
+
 	metrics := observability.NewMetrics(cfg.MaxTenantLabels)
 
 	tenants := postgres.NewTenantRepo(db)
@@ -191,7 +208,7 @@ func run() error {
 	}
 
 	router := httpapi.NewRouter(httpapi.Deps{
-		Flags: flags, Config: cfg, Log: log, Metrics: metrics, DB: db, Cache: cache,
+		DistributedFlags: distributedFlags, Flags: flags, Config: cfg, Log: log, Metrics: metrics, DB: db, Cache: cache,
 		Keyring: keyring, Issuer: issuer, AuthSvc: authSvc,
 		Evaluator: evaluator, RiskEngine: riskEngine, Auditor: auditor,
 		Tenants: tenants, Users: users, Roles: roles, Sessions: sessions, Audit: auditRepo,

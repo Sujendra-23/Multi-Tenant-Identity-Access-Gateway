@@ -9,6 +9,10 @@ data:
   METRICS_ADDR: ":9090"
   REDIS_ADDR: "redis:6379"
   REDIS_DB: "0"
+  # Set redis on every replica to enable shared flag updates through the admin API.
+  FEATURE_FLAGS_BACKEND: "file"
+  FEATURE_FLAGS_REDIS_KEY: "identity-gateway:feature-flags"
+  FEATURE_FLAGS_SYNC_INTERVAL: "5s"
   JWT_ISSUER: "https://gateway.internal"
   JWT_AUDIENCE: "identity-gateway"
   ACCESS_TOKEN_TTL: "5m"
