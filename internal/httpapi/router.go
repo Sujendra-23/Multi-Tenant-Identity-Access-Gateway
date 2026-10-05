@@ -15,6 +15,7 @@ import (
 	"github.com/sujendra/identity-gateway/internal/auth"
 	"github.com/sujendra/identity-gateway/internal/authz"
 	"github.com/sujendra/identity-gateway/internal/config"
+	"github.com/sujendra/identity-gateway/internal/featureflags"
 	"github.com/sujendra/identity-gateway/internal/httpapi/handlers"
 	"github.com/sujendra/identity-gateway/internal/httpapi/middleware"
 	"github.com/sujendra/identity-gateway/internal/observability"
@@ -24,6 +25,7 @@ import (
 
 // Deps bundles everything the router needs to build handlers and middleware.
 type Deps struct {
+	Flags      *featureflags.Flags
 	Config     *config.Config
 	Log        *slog.Logger
 	Metrics    *observability.Metrics
@@ -107,7 +109,7 @@ func NewRouter(d Deps) http.Handler {
 	roleHandler := handlers.NewRoleHandler(d.Roles, d.Auditor, d.Log)
 	auditHandler := handlers.NewAuditHandler(d.Audit, d.Log)
 	sessionHandler := handlers.NewSessionHandler(d.Sessions, d.AuthSvc, d.Auditor, d.Log)
-	proxyHandler, err := handlers.NewProxyHandler(d.Config.Upstreams, d.Log)
+	proxyHandler, err := handlers.NewProxyHandler(d.Config.Upstreams, d.Log, d.Flags)
 	if err != nil {
 		d.Log.Error("could not build upstream proxies", "error", err)
 	}

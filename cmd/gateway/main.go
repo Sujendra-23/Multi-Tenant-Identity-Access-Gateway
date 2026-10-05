@@ -19,6 +19,7 @@ import (
 	"github.com/sujendra/identity-gateway/internal/auth"
 	"github.com/sujendra/identity-gateway/internal/authz"
 	"github.com/sujendra/identity-gateway/internal/config"
+	"github.com/sujendra/identity-gateway/internal/featureflags"
 	"github.com/sujendra/identity-gateway/internal/httpapi"
 	"github.com/sujendra/identity-gateway/internal/httpapi/middleware"
 	"github.com/sujendra/identity-gateway/internal/observability"
@@ -95,6 +96,31 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	flags := &featureflags.Flags{}
+	flagsPath := os.Getenv("FEATURE_FLAGS_FILE")
+	if flagsPath != "" {
+		if err := flags.Reload(flagsPath); err != nil {
+			return fmt.Errorf("load feature flags: %w", err)
+		}
+		reload := make(chan os.Signal, 1)
+		signal.Notify(reload, syscall.SIGHUP)
+		defer signal.Stop(reload)
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-reload:
+					if err := flags.Reload(flagsPath); err != nil {
+						log.Error("feature flags reload rejected; retaining previous configuration", "error", err)
+					} else {
+						log.Info("feature flags reloaded")
+					}
+				}
+			}
+		}()
+	}
+
 	db, err := postgres.Connect(ctx, cfg.PostgresDSN)
 	if err != nil {
 		return fmt.Errorf("connect postgres: %w", err)
@@ -165,7 +191,7 @@ func run() error {
 	}
 
 	router := httpapi.NewRouter(httpapi.Deps{
-		Config: cfg, Log: log, Metrics: metrics, DB: db, Cache: cache,
+		Flags: flags, Config: cfg, Log: log, Metrics: metrics, DB: db, Cache: cache,
 		Keyring: keyring, Issuer: issuer, AuthSvc: authSvc,
 		Evaluator: evaluator, RiskEngine: riskEngine, Auditor: auditor,
 		Tenants: tenants, Users: users, Roles: roles, Sessions: sessions, Audit: auditRepo,

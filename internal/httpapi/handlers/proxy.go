@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/sujendra/identity-gateway/internal/featureflags"
 	"github.com/sujendra/identity-gateway/internal/httpapi/reqctx"
 )
 
@@ -28,13 +29,14 @@ import (
 type ProxyHandler struct {
 	proxies map[string]*httputil.ReverseProxy
 	log     *slog.Logger
+	flags   *featureflags.Flags
 }
 
 // NewProxyHandler builds one reverse proxy per configured upstream. Building
 // them once at startup (rather than per request) means connection pooling
 // actually works: repeated requests to the same upstream reuse TCP connections
 // instead of paying a new handshake every time.
-func NewProxyHandler(upstreams map[string]string, log *slog.Logger) (*ProxyHandler, error) {
+func NewProxyHandler(upstreams map[string]string, log *slog.Logger, flags *featureflags.Flags) (*ProxyHandler, error) {
 	proxies := make(map[string]*httputil.ReverseProxy, len(upstreams))
 	for name, raw := range upstreams {
 		target, err := url.Parse(raw)
@@ -48,7 +50,7 @@ func NewProxyHandler(upstreams map[string]string, log *slog.Logger) (*ProxyHandl
 		}
 		proxies[name] = rp
 	}
-	return &ProxyHandler{proxies: proxies, log: log}, nil
+	return &ProxyHandler{proxies: proxies, log: log, flags: flags}, nil
 }
 
 // Forward dispatches to the upstream named by the {service} path segment,
@@ -75,6 +77,11 @@ func (h *ProxyHandler) Forward(w http.ResponseWriter, r *http.Request) {
 	claims := reqctx.Claims(r.Context())
 	if tenant == nil || claims == nil {
 		writeError(w, r, http.StatusInternalServerError, "internal_error", "identity context missing")
+		return
+	}
+
+	if h.flags != nil && !h.flags.ProxyEnabled(tenant.Slug) {
+		writeError(w, r, http.StatusServiceUnavailable, "feature_disabled", "proxy access is disabled for this tenant")
 		return
 	}
 

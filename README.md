@@ -33,6 +33,7 @@ stack to watch it happen.
 | JWT session management with token rotation | Ed25519-signed access tokens with automatic key rotation (`internal/auth/keyring.go`), opaque single-use refresh tokens with atomic rotation and replay detection (`internal/store/redisstore/sessions.go`). |
 | Zero-trust request verification | Every authenticated request re-checks token liveness, tenant match, policy currency, and a continuous risk score — not just signature validity. `internal/httpapi/middleware/auth.go`, `internal/authz/risk.go`. |
 | Rate limiting + audit logging per tenant | Layered token-bucket limits (IP → user → tenant → login) in Redis (`internal/store/redisstore/ratelimit.go`); an append-only, hash-chained, tamper-evident audit log per tenant (`internal/store/postgres/audit.go`). |
+| Hot-reloadable tenant feature flags | Proxy rollout controls with global defaults and tenant overrides; validated JSON snapshots atomically reloaded on `SIGHUP` (`internal/featureflags/`). |
 | Kubernetes/EKS | Full manifest set in `deploy/k8s/`, validated end-to-end against a real cluster (see [Kubernetes](#kubernetes)). |
 | Prometheus/Grafana | `internal/observability/`, dashboard at `deploy/grafana/dashboards/identity-gateway.json`. |
 
@@ -427,7 +428,57 @@ deployments should review at least these:
 | `MAX_FAILED_LOGINS`, `LOCKOUT_DURATION` | `5`, `15m` | |
 | `TRUSTED_PROXY_CIDRS` | RFC1918 ranges | Only trust `X-Forwarded-For` from these peers. |
 | `BOOTSTRAP_KEY` | — | Gates tenant provisioning; treat as a root credential. |
+| `FEATURE_FLAGS_FILE` | unset | Optional JSON proxy flags; reload with `SIGHUP`. See below. |
 | `UPSTREAMS` | — | `name=url,name2=url2` — backends the proxy can reach. |
+
+### Hot-reloadable proxy feature flags
+
+Set `FEATURE_FLAGS_FILE` to a JSON file before starting the gateway. If unset,
+proxy access keeps its existing behavior. If set, an unreadable or invalid file
+prevents startup. For example:
+
+```bash
+cp deploy/feature-flags.example.json /tmp/gateway-flags.json
+FEATURE_FLAGS_FILE=/tmp/gateway-flags.json go run ./cmd/gateway
+```
+
+The file contains a required global default and optional tenant-slug overrides:
+
+```json
+{
+  "proxy_enabled": false,
+  "tenants": { "acme": true }
+}
+```
+
+This enables proxy access only for `acme`. An explicit `false` override can
+also disable one tenant while the global default is `true`. Evaluation uses
+the tenant established by the authentication pipeline. Flags never grant RBAC
+permissions or bypass token, rate-limit, or risk checks. Disabled requests
+return HTTP `503` with error code `feature_disabled` without calling upstream.
+
+To change flags without restarting, replace the file atomically (write a
+sibling file and rename it over the configured path), then signal the gateway:
+
+```bash
+kill -HUP <gateway-process-pid>
+# Docker Compose, after mounting the file's parent directory and setting
+# FEATURE_FLAGS_FILE in the gateway service:
+docker compose kill -s SIGHUP gateway
+```
+
+When using `go run`, signal the compiled gateway child process, not the Go
+launcher. Only send `SIGHUP` when `FEATURE_FLAGS_FILE` is configured.
+The supplied Compose/Kubernetes manifests do not mount this optional file.
+Mount its parent directory rather than a single file so atomic replacements
+remain visible inside the container.
+
+Each request reads one immutable snapshot. Invalid reloads retain the last
+valid snapshot and emit an error log; successful reloads emit an info log.
+Already-forwarded requests finish normally. This reloads only proxy feature
+flags, not environment settings or upstream URLs. For multiple replicas,
+distribute the file and signal each process; there is no coordinated rollout
+service or management API. Restrict file write access to trusted operators.
 
 ## Design decisions and trade-offs
 
