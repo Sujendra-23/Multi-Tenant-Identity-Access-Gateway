@@ -2,6 +2,8 @@
 package featureflags
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,23 +12,34 @@ import (
 )
 
 type snapshot struct {
-	ProxyEnabled *bool            `json:"proxy_enabled"`
-	Tenants      map[string]*bool `json:"tenants"`
+	ProxyEnabled   *bool            `json:"proxy_enabled"`
+	Tenants        map[string]*bool `json:"tenants"`
+	RolloutPercent *int             `json:"rollout_percent,omitempty"`
 }
 
 // Flags holds an immutable snapshot. The zero value preserves existing behavior.
 // Tenant overrides use the authenticated tenant's slug, never a client parameter.
 type Flags struct{ current atomic.Pointer[snapshot] }
 
-func (f *Flags) ProxyEnabled(tenant string) bool {
+func (f *Flags) ProxyEnabled(tenantID, tenantSlug string) bool {
 	s := f.current.Load()
 	if s == nil {
 		return true
 	}
-	if enabled, ok := s.Tenants[tenant]; ok {
+	if enabled, ok := s.Tenants[tenantSlug]; ok {
 		return *enabled
 	}
-	return *s.ProxyEnabled
+	if !*s.ProxyEnabled {
+		return false
+	}
+	return s.RolloutPercent == nil || rolloutEnabled(tenantID, "proxy_enabled", *s.RolloutPercent)
+}
+
+// rolloutEnabled assigns a stable bucket per tenant and flag. Raising the
+// percentage only adds tenants; evaluations require no shared mutable state.
+func rolloutEnabled(tenantID, flagName string, percent int) bool {
+	sum := sha256.Sum256([]byte(tenantID + "\x00" + flagName))
+	return int(binary.BigEndian.Uint64(sum[:8])%100) < percent
 }
 
 // Reload publishes only a completely decoded and validated configuration.
@@ -48,6 +61,9 @@ func (f *Flags) Reload(path string) error {
 	}
 	if next.ProxyEnabled == nil {
 		return fmt.Errorf("proxy_enabled must be a boolean")
+	}
+	if next.RolloutPercent != nil && (*next.RolloutPercent < 0 || *next.RolloutPercent > 100) {
+		return fmt.Errorf("rollout_percent must be an integer from 0 to 100")
 	}
 	for slug, enabled := range next.Tenants {
 		if enabled == nil {

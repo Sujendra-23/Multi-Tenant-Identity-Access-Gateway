@@ -64,4 +64,23 @@ func TestProxyFeatureFlagReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	request("acme", 204)
+	for _, tc := range []struct {
+		body   string
+		status int
+	}{
+		{`{"proxy_enabled":true,"rollout_percent":0}`, 503},
+		{`{"proxy_enabled":true,"rollout_percent":100}`, 204},
+	} {
+		before := calls.Load()
+		if err := os.WriteFile(path, []byte(tc.body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := flags.Reload(path); err != nil {
+			t.Fatal(err)
+		}
+		request("acme", tc.status)
+		if tc.status == 503 && calls.Load() != before {
+			t.Fatal("excluded tenant reached upstream")
+		}
+	}
 }

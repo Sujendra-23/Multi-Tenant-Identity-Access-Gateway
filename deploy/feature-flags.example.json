@@ -1,4 +1,5 @@
 {
   "proxy_enabled": true,
+  "rollout_percent": 100,
   "tenants": {}
 }

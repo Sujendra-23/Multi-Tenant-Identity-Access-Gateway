@@ -80,7 +80,7 @@ func (h *ProxyHandler) Forward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.flags != nil && !h.flags.ProxyEnabled(tenant.Slug) {
+	if h.flags != nil && !h.flags.ProxyEnabled(tenant.ID.String(), tenant.Slug) {
 		writeError(w, r, http.StatusServiceUnavailable, "feature_disabled", "proxy access is disabled for this tenant")
 		return
 	}

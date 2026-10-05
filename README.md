@@ -457,6 +457,29 @@ the tenant established by the authentication pipeline. Flags never grant RBAC
 permissions or bypass token, rate-limit, or risk checks. Disabled requests
 return HTTP `503` with error code `feature_disabled` without calling upstream.
 
+To progressively enable proxy access for a stable percentage of tenants, use:
+
+```json
+{
+  "proxy_enabled": true,
+  "rollout_percent": 10,
+  "tenants": {}
+}
+```
+
+`rollout_percent` is an optional integer from 0 to 100 (omitted or `null`
+means 100). Each authenticated tenant is assigned a bucket using SHA-256 of
+its immutable tenant ID, a NUL separator, and the flag name `proxy_enabled`;
+the first eight digest bytes, interpreted as an unsigned big-endian integer,
+modulo 100 determine the bucket. Buckets below the percentage are enabled.
+The percentage is approximate across tenants, not a percentage of requests.
+Increasing it from 10 to 100 keeps the initial cohort enabled and adds the
+remaining tenants. Tenant renames do not change the cohort, and processes
+using the same configuration make the same decision without coordination.
+Explicit slug overrides take precedence over both the percentage and global
+default. A global `proxy_enabled: false` still disables tenants without an
+explicit enable override. Invalid percentages reject the entire reload.
+
 To change flags without restarting, replace the file atomically (write a
 sibling file and rename it over the configured path), then signal the gateway:
 
