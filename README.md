@@ -414,6 +414,16 @@ A managed Postgres/Redis (RDS, Cloud SQL, ElastiCache) is a better fit than
 the bare `StatefulSet`/`Deployment` here for anything beyond a demo — see
 comments in `03-postgres.yaml` / `04-redis.yaml`.
 
+### Terraform for EKS + RDS + ElastiCache
+
+`deploy/terraform/` is a Terraform module for that managed setup (VPC, EKS with
+NetworkPolicy enforcement enabled, RDS Postgres, ElastiCache Redis). See
+[`deploy/terraform/README.md`](deploy/terraform/README.md). **It has only been
+validated and planned offline (`terraform validate`, and `terraform plan` with
+mock credentials: 46 resources to add) — it has never been applied to an AWS
+account, and the cluster in "validated end-to-end against a real cluster"
+above is the local `kind` cluster, not EKS.**
+
 ## Testing
 
 ```bash

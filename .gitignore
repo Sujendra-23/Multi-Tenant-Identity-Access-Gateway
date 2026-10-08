@@ -7,3 +7,9 @@
 /upstream
 /seed
 deploy/tls/dev/
+
+# terraform local state/cache (the provider lock file IS committed)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
