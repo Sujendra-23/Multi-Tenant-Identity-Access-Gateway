@@ -1,0 +1,40 @@
+sequenceDiagram
+    autonumber
+    actor C as Client
+    participant H as AuthHandler.Refresh<br/>(behind tenant resolver, no auth)
+    participant S as auth.Service
+    participant R as Redis
+    participant PG as Postgres
+    participant A as Audit logger<br/>(buffered)
+
+    C->>H: POST /v1/auth/refresh<br/>X-Tenant, {refresh_token}
+    H->>S: Refresh(token, ip, ua, deviceHash)
+    S->>S: NewRefreshToken (the successor)
+    S->>R: RotateRefreshToken: one atomic Lua script<br/>KEYS rt:hash(old), rtc:hash(old), rt:hash(new)
+
+    alt old token not found and a consumed tombstone rtc: exists (REUSE)
+        R-->>S: REUSE + the old record (family id, tenant, user)
+        S->>R: RevokeFamily: DEL every sess: key in fam:{family}
+        S->>PG: sessions.RevokeFamily(reason refresh_token_reuse)
+        S->>A: auth.refresh_reuse_detected deny, risk 100
+        S-->>C: 401 session_revoked (log in again)
+    else old token not found, no tombstone (MISSING)
+        R-->>S: MISSING
+        S-->>C: 401 invalid_credentials
+    else token present but its sess: key is gone (SESSION_REVOKED)
+        R-->>S: SESSION_REVOKED (old token deleted)
+        S-->>C: 401 token_revoked
+    else token present and session live (OK)
+        Note over R: DEL rt:old, SET rtc:old (tombstone, TTL),<br/>SET rt:new with generation + 1
+        R-->>S: OK + successor record
+        S->>PG: tenants.ByID, users.ByID (source of truth, not the token)
+        alt tenant suspended, user inactive, or account locked
+            S-->>C: 403 tenant_suspended / 403 user_inactive / 423 account_locked
+        end
+        S->>PG: roles.EffectivePermissions (current roles)
+        S->>S: Mint new access token<br/>(current roles, current policy version)
+        S->>R: TouchSession (extend session TTL)
+        S->>PG: sessions.Touch (failure only logged)
+        S->>A: auth.refresh allow (session, generation)
+        S-->>C: 200 {access_token, refresh_token (new), session_id}
+    end

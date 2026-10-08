@@ -16,6 +16,7 @@ stack to watch it happen.
 - [What this actually demonstrates](#what-this-actually-demonstrates)
 - [Architecture](#architecture)
 - [Quick start (docker compose)](#quick-start-docker-compose)
+- [Authentication flows](#authentication-flows)
 - [Seeing it work](#seeing-it-work)
 - [Kubernetes](#kubernetes)
 - [Testing](#testing)
@@ -150,6 +151,125 @@ go build -o bin/gateway  ./cmd/gateway
 go build -o bin/seed     ./cmd/seed
 go build -o bin/upstream ./cmd/upstream
 ./bin/gateway   # same env vars as above
+```
+
+## Authentication flows
+
+Sequence diagrams of the two core exchanges, written from the code in
+`internal/auth/service.go`, `internal/httpapi/handlers/auth.go` and the rotation
+script in `internal/store/redisstore/sessions.go`. The Mermaid sources are also
+committed as `docs/diagrams/login.mmd` and `docs/diagrams/refresh.mmd` (the
+README blocks below are copies of them).
+
+### Login
+
+Every failure that could reveal whether an account exists returns the same
+`401 invalid_credentials`; the unknown-user path burns equivalent hashing time.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Client
+    participant G as Gateway middleware<br/>(IP limit, TenantResolver,<br/>tenant and login limits)
+    participant H as AuthHandler.Login
+    participant S as auth.Service
+    participant PG as Postgres
+    participant R as Redis
+    participant A as Audit logger<br/>(buffered)
+
+    C->>G: POST /v1/auth/login<br/>X-Tenant, {email, password}
+    G->>R: per-IP token bucket
+    G->>PG: tenants.BySlug(X-Tenant)
+    alt tenant header missing or unknown
+        G-->>C: 400 tenant_required / 404 tenant_not_found
+    end
+    G->>R: per-tenant bucket, then login bucket (keyed tenant + IP)
+    alt any bucket empty
+        G-->>C: 429 rate limited
+    end
+    G->>H: request with resolved tenant
+    H->>S: Login(tenant, email, password, ip, ua, deviceHash)
+    alt tenant suspended
+        S-->>C: 403 tenant_suspended
+    end
+    S->>PG: users.ByEmail(tenant, email)
+    alt no such user
+        S->>S: BurnTimingBudget (argon2-equivalent work)
+        S->>R: RecordAuthFailure(email)
+        S->>A: auth.login deny unknown_user
+        S-->>C: 401 invalid_credentials
+    end
+    alt account locked or inactive
+        S->>A: auth.login deny account_locked / user_status
+        S-->>C: 423 account_locked / 403 user_inactive
+    end
+    S->>S: VerifyPassword (argon2)
+    alt wrong password
+        S->>PG: RecordFailedLogin (locks after MAX_FAILED_LOGINS)
+        S->>R: RecordAuthFailure(email)
+        S->>A: auth.login deny invalid_password
+        S-->>C: 401 invalid_credentials (same body as unknown user)
+    end
+    S->>PG: RecordSuccessfulLogin (clear failure state)
+    S->>R: ClearAuthFailures(email)
+    S->>PG: roles.EffectivePermissions(user)
+    S->>S: Mint Ed25519 access token<br/>(tenant, session, roles, policy version, AMR=pwd,<br/>device and IP bindings)
+    S->>S: NewRefreshToken (opaque, random)
+    S->>R: CreateSession in one MULTI: sess key, rt:hash(refresh),<br/>fam set, expiries = refresh TTL
+    S->>PG: sessions.Create (durable record, new family id)
+    S->>A: auth.login allow
+    S-->>H: TokenPair + user
+    H-->>C: 200 {access_token, refresh_token, expires_in, session_id, user}
+    A-)PG: batched hash-chained append (every AUDIT_FLUSH_INTERVAL)
+```
+
+### Refresh-token rotation and reuse detection
+
+Rotation is a single atomic Lua script, so a token can be redeemed exactly once.
+Replaying a spent token revokes the whole session family; the legitimate
+sibling token then fails as `token_revoked`, because its session is gone.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Client
+    participant H as AuthHandler.Refresh<br/>(behind tenant resolver, no auth)
+    participant S as auth.Service
+    participant R as Redis
+    participant PG as Postgres
+    participant A as Audit logger<br/>(buffered)
+
+    C->>H: POST /v1/auth/refresh<br/>X-Tenant, {refresh_token}
+    H->>S: Refresh(token, ip, ua, deviceHash)
+    S->>S: NewRefreshToken (the successor)
+    S->>R: RotateRefreshToken: one atomic Lua script<br/>KEYS rt:hash(old), rtc:hash(old), rt:hash(new)
+
+    alt old token not found and a consumed tombstone rtc: exists (REUSE)
+        R-->>S: REUSE + the old record (family id, tenant, user)
+        S->>R: RevokeFamily: DEL every sess: key in fam:{family}
+        S->>PG: sessions.RevokeFamily(reason refresh_token_reuse)
+        S->>A: auth.refresh_reuse_detected deny, risk 100
+        S-->>C: 401 session_revoked (log in again)
+    else old token not found, no tombstone (MISSING)
+        R-->>S: MISSING
+        S-->>C: 401 invalid_credentials
+    else token present but its sess: key is gone (SESSION_REVOKED)
+        R-->>S: SESSION_REVOKED (old token deleted)
+        S-->>C: 401 token_revoked
+    else token present and session live (OK)
+        Note over R: DEL rt:old, SET rtc:old (tombstone, TTL),<br/>SET rt:new with generation + 1
+        R-->>S: OK + successor record
+        S->>PG: tenants.ByID, users.ByID (source of truth, not the token)
+        alt tenant suspended, user inactive, or account locked
+            S-->>C: 403 tenant_suspended / 403 user_inactive / 423 account_locked
+        end
+        S->>PG: roles.EffectivePermissions (current roles)
+        S->>S: Mint new access token<br/>(current roles, current policy version)
+        S->>R: TouchSession (extend session TTL)
+        S->>PG: sessions.Touch (failure only logged)
+        S->>A: auth.refresh allow (session, generation)
+        S-->>C: 200 {access_token, refresh_token (new), session_id}
+    end
 ```
 
 ## Seeing it work

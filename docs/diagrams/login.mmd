@@ -1,0 +1,54 @@
+sequenceDiagram
+    autonumber
+    actor C as Client
+    participant G as Gateway middleware<br/>(IP limit, TenantResolver,<br/>tenant and login limits)
+    participant H as AuthHandler.Login
+    participant S as auth.Service
+    participant PG as Postgres
+    participant R as Redis
+    participant A as Audit logger<br/>(buffered)
+
+    C->>G: POST /v1/auth/login<br/>X-Tenant, {email, password}
+    G->>R: per-IP token bucket
+    G->>PG: tenants.BySlug(X-Tenant)
+    alt tenant header missing or unknown
+        G-->>C: 400 tenant_required / 404 tenant_not_found
+    end
+    G->>R: per-tenant bucket, then login bucket (keyed tenant + IP)
+    alt any bucket empty
+        G-->>C: 429 rate limited
+    end
+    G->>H: request with resolved tenant
+    H->>S: Login(tenant, email, password, ip, ua, deviceHash)
+    alt tenant suspended
+        S-->>C: 403 tenant_suspended
+    end
+    S->>PG: users.ByEmail(tenant, email)
+    alt no such user
+        S->>S: BurnTimingBudget (argon2-equivalent work)
+        S->>R: RecordAuthFailure(email)
+        S->>A: auth.login deny unknown_user
+        S-->>C: 401 invalid_credentials
+    end
+    alt account locked or inactive
+        S->>A: auth.login deny account_locked / user_status
+        S-->>C: 423 account_locked / 403 user_inactive
+    end
+    S->>S: VerifyPassword (argon2)
+    alt wrong password
+        S->>PG: RecordFailedLogin (locks after MAX_FAILED_LOGINS)
+        S->>R: RecordAuthFailure(email)
+        S->>A: auth.login deny invalid_password
+        S-->>C: 401 invalid_credentials (same body as unknown user)
+    end
+    S->>PG: RecordSuccessfulLogin (clear failure state)
+    S->>R: ClearAuthFailures(email)
+    S->>PG: roles.EffectivePermissions(user)
+    S->>S: Mint Ed25519 access token<br/>(tenant, session, roles, policy version, AMR=pwd,<br/>device and IP bindings)
+    S->>S: NewRefreshToken (opaque, random)
+    S->>R: CreateSession in one MULTI: sess key, rt:hash(refresh),<br/>fam set, expiries = refresh TTL
+    S->>PG: sessions.Create (durable record, new family id)
+    S->>A: auth.login allow
+    S-->>H: TokenPair + user
+    H-->>C: 200 {access_token, refresh_token, expires_in, session_id, user}
+    A-)PG: batched hash-chained append (every AUDIT_FLUSH_INTERVAL)
