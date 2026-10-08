@@ -18,6 +18,21 @@ type Config struct {
 	HTTPAddr    string
 	MetricsAddr string
 
+	// HTTPS for the public API. Both set: the API listener serves TLS (1.2+,
+	// AEAD suites only) and reloads the pair when the files change. Neither
+	// set: plain HTTP, for deployments where an ingress terminates TLS.
+	TLSCertFile string
+	TLSKeyFile  string
+
+	// Mutual TLS for proxied upstream calls. With UpstreamCAFile set, every
+	// upstream must be https, its certificate must chain to that CA (system
+	// roots are not trusted), and the gateway presents the client pair.
+	UpstreamCAFile         string
+	UpstreamClientCertFile string
+	UpstreamClientKeyFile  string
+	// UpstreamServerName overrides the name checked in upstream certificates.
+	UpstreamServerName string
+
 	PostgresDSN string
 	RedisAddr   string
 	RedisPass   string
@@ -81,6 +96,12 @@ func Load() (*Config, error) {
 		Env:                      env("ENV", "development"),
 		HTTPAddr:                 env("HTTP_ADDR", ":8080"),
 		MetricsAddr:              env("METRICS_ADDR", ":9090"),
+		TLSCertFile:              env("TLS_CERT_FILE", ""),
+		TLSKeyFile:               env("TLS_KEY_FILE", ""),
+		UpstreamCAFile:           env("UPSTREAM_CA_FILE", ""),
+		UpstreamClientCertFile:   env("UPSTREAM_CLIENT_CERT_FILE", ""),
+		UpstreamClientKeyFile:    env("UPSTREAM_CLIENT_KEY_FILE", ""),
+		UpstreamServerName:       env("UPSTREAM_SERVER_NAME", ""),
 		PostgresDSN:              env("POSTGRES_DSN", "postgres://gateway:gateway@localhost:5432/gateway?sslmode=disable"),
 		RedisAddr:                env("REDIS_ADDR", "localhost:6379"),
 		RedisPass:                env("REDIS_PASSWORD", ""),
@@ -133,6 +154,24 @@ func (c *Config) validate() error {
 		return fmt.Errorf("FEATURE_FLAGS_SYNC_INTERVAL must be positive")
 	}
 
+	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
+		return fmt.Errorf("TLS_CERT_FILE and TLS_KEY_FILE must be set together")
+	}
+	if (c.UpstreamClientCertFile == "") != (c.UpstreamClientKeyFile == "") {
+		return fmt.Errorf("UPSTREAM_CLIENT_CERT_FILE and UPSTREAM_CLIENT_KEY_FILE must be set together")
+	}
+	if c.UpstreamClientCertFile != "" && c.UpstreamCAFile == "" {
+		return fmt.Errorf("UPSTREAM_CA_FILE is required when an upstream client certificate is configured")
+	}
+	if c.UpstreamCAFile != "" {
+		// A plain-http upstream would silently bypass the mTLS the operator asked for.
+		for name, raw := range c.Upstreams {
+			if !strings.HasPrefix(strings.ToLower(raw), "https://") {
+				return fmt.Errorf("upstream %q must use https when UPSTREAM_CA_FILE is set", name)
+			}
+		}
+	}
+
 	if c.AccessTokenTTL <= 0 || c.AccessTokenTTL > time.Hour {
 		return fmt.Errorf("ACCESS_TOKEN_TTL must be in (0, 1h]; got %s", c.AccessTokenTTL)
 	}
@@ -155,6 +194,9 @@ func (c *Config) validate() error {
 }
 
 func (c *Config) IsProduction() bool { return c.Env == "production" }
+
+// TLSEnabled reports whether the API listener serves HTTPS.
+func (c *Config) TLSEnabled() bool { return c.TLSCertFile != "" }
 
 func parseUpstreams(raw string) map[string]string {
 	out := map[string]string{}

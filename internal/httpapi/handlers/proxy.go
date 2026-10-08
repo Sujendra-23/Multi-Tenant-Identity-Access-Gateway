@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"crypto/tls"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
@@ -36,7 +37,18 @@ type ProxyHandler struct {
 // them once at startup (rather than per request) means connection pooling
 // actually works: repeated requests to the same upstream reuse TCP connections
 // instead of paying a new handshake every time.
-func NewProxyHandler(upstreams map[string]string, log *slog.Logger, flags *featureflags.Flags) (*ProxyHandler, error) {
+//
+// upstreamTLS, when non-nil, is the mutual-TLS client configuration used for
+// every upstream: the upstream must present a certificate from the pinned CA,
+// and the gateway authenticates itself with its own client certificate, so
+// neither side relies on the network alone to know who is on the other end.
+func NewProxyHandler(upstreams map[string]string, upstreamTLS *tls.Config, log *slog.Logger, flags *featureflags.Flags) (*ProxyHandler, error) {
+	var transport http.RoundTripper = http.DefaultTransport
+	if upstreamTLS != nil {
+		t := http.DefaultTransport.(*http.Transport).Clone()
+		t.TLSClientConfig = upstreamTLS
+		transport = t
+	}
 	proxies := make(map[string]*httputil.ReverseProxy, len(upstreams))
 	for name, raw := range upstreams {
 		target, err := url.Parse(raw)
@@ -44,6 +56,7 @@ func NewProxyHandler(upstreams map[string]string, log *slog.Logger, flags *featu
 			return nil, err
 		}
 		rp := httputil.NewSingleHostReverseProxy(target)
+		rp.Transport = transport
 		rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Error("upstream request failed", "upstream", name, "error", err, "request_id", reqctx.RequestID(r.Context()))
 			writeError(w, r, http.StatusBadGateway, "upstream_unavailable", "the backend service could not be reached")

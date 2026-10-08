@@ -7,3 +7,4 @@ deploy
 .env
 .env.example
 scratchpad
+deploy/tls/dev/

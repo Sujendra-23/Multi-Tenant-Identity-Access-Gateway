@@ -5,6 +5,7 @@
 package httpapi
 
 import (
+	"crypto/tls"
 	"log/slog"
 	"net/http"
 	"time"
@@ -28,16 +29,18 @@ type Deps struct {
 	Flags            *featureflags.Flags
 	DistributedFlags *featureflags.Distributed
 	Config           *config.Config
-	Log              *slog.Logger
-	Metrics          *observability.Metrics
-	DB               *postgres.DB
-	Cache            *redisstore.Client
-	Keyring          *auth.Keyring
-	Issuer           *auth.TokenIssuer
-	AuthSvc          *auth.Service
-	Evaluator        *authz.Evaluator
-	RiskEngine       *authz.RiskEngine
-	Auditor          *audit.Logger
+	// UpstreamTLS is the mutual-TLS client config for proxied calls, or nil.
+	UpstreamTLS *tls.Config
+	Log         *slog.Logger
+	Metrics     *observability.Metrics
+	DB          *postgres.DB
+	Cache       *redisstore.Client
+	Keyring     *auth.Keyring
+	Issuer      *auth.TokenIssuer
+	AuthSvc     *auth.Service
+	Evaluator   *authz.Evaluator
+	RiskEngine  *authz.RiskEngine
+	Auditor     *audit.Logger
 
 	Tenants  *postgres.TenantRepo
 	Users    *postgres.UserRepo
@@ -119,7 +122,7 @@ func NewRouter(d Deps) http.Handler {
 	roleHandler := handlers.NewRoleHandler(d.Roles, d.Auditor, d.Log)
 	auditHandler := handlers.NewAuditHandler(d.Audit, d.Log)
 	sessionHandler := handlers.NewSessionHandler(d.Sessions, d.AuthSvc, d.Auditor, d.Log)
-	proxyHandler, err := handlers.NewProxyHandler(d.Config.Upstreams, d.Log, d.Flags)
+	proxyHandler, err := handlers.NewProxyHandler(d.Config.Upstreams, d.UpstreamTLS, d.Log, d.Flags)
 	if err != nil {
 		d.Log.Error("could not build upstream proxies", "error", err)
 	}

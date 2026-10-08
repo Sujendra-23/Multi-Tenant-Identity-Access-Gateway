@@ -166,6 +166,12 @@ if [ "$STATUS" = "200" ] && echo "$BODY" | json_get "['token_independently_verif
 else
   bad "proxy call did not yield an independently-verified token: $STATUS $BODY"
 fi
+if [ "${EXPECT_UPSTREAM_MTLS:-}" = "1" ]; then
+  MTLS_CLIENT=$(echo "$BODY" | json_get ".get('mtls_client', '')")
+  [ "$MTLS_CLIENT" = "identity-gateway" ] \
+    && ok "upstream authenticated the gateway by its mTLS client certificate" \
+    || bad "upstream did not see the gateway's client certificate: $BODY"
+fi
 
 note "10. Audit chain integrity"
 # The audit writer batches to Postgres on a timer (AUDIT_FLUSH_INTERVAL,

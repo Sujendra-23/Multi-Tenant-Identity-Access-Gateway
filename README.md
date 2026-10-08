@@ -33,6 +33,7 @@ stack to watch it happen.
 | JWT session management with token rotation | Ed25519-signed access tokens with automatic key rotation (`internal/auth/keyring.go`), opaque single-use refresh tokens with atomic rotation and replay detection (`internal/store/redisstore/sessions.go`). |
 | Zero-trust request verification | Every authenticated request re-checks token liveness, tenant match, policy currency, and a continuous risk score — not just signature validity. `internal/httpapi/middleware/auth.go`, `internal/authz/risk.go`. |
 | Rate limiting + audit logging per tenant | Layered token-bucket limits (IP → user → tenant → login) in Redis (`internal/store/redisstore/ratelimit.go`); an append-only, hash-chained, tamper-evident audit log per tenant (`internal/store/postgres/audit.go`). |
+| TLS and mutual TLS | HTTPS on the API (TLS 1.2+, AEAD suites only) and mTLS from the proxy to upstreams, pinned to an internal CA with no fallback to system roots; certificates hot-reload on rotation (`internal/tlsconfig/`). |
 | Hot-reloadable tenant feature flags | Stable percentage rollouts and tenant overrides; local `SIGHUP` reloads or revision-checked admin updates propagated through Redis pub/sub with periodic reconciliation (`internal/featureflags/`). |
 | Kubernetes/EKS | Full manifest set in `deploy/k8s/`, validated end-to-end against a real cluster (see [Kubernetes](#kubernetes)). |
 | Prometheus/Grafana | `internal/observability/`, dashboard at `deploy/grafana/dashboards/identity-gateway.json`. |
@@ -435,6 +436,44 @@ deployments should review at least these:
 | `FEATURE_FLAGS_REDIS_KEY` | `identity-gateway:feature-flags` | Shared Redis key; use a unique namespace per deployment. |
 | `FEATURE_FLAGS_SYNC_INTERVAL` | `5s` | Positive reconciliation interval; repairs missed pub/sub notifications. |
 | `UPSTREAMS` | — | `name=url,name2=url2` — backends the proxy can reach. |
+| `TLS_CERT_FILE`, `TLS_KEY_FILE` | unset | Serve the API over HTTPS. Set both or neither; unset means plain HTTP behind a TLS-terminating ingress. |
+| `UPSTREAM_CA_FILE` | unset | Enables mTLS to upstreams: the only CA trusted for upstream certificates. Every upstream must then be `https://`. |
+| `UPSTREAM_CLIENT_CERT_FILE`, `UPSTREAM_CLIENT_KEY_FILE` | unset | Client certificate the gateway presents to upstreams. |
+| `UPSTREAM_SERVER_NAME` | dialed host | Override the name verified in upstream certificates. |
+
+### TLS and mutual TLS
+
+With `TLS_CERT_FILE`/`TLS_KEY_FILE` set, the API listener serves HTTPS with a
+TLS 1.2 floor and only forward-secret AEAD cipher suites. With
+`UPSTREAM_CA_FILE` set, every proxied call is mutual TLS 1.3: the upstream must
+present a certificate that chains to that CA (system roots are never consulted,
+so a publicly-issued or self-signed certificate cannot impersonate an internal
+service), and the gateway authenticates itself with its client certificate.
+The demo upstream requires that client certificate and reports the verified
+caller in `mtls_client`. This layers transport identity under the existing
+forwarded-JWT check, so neither depends on the network boundary alone.
+
+Certificates are re-read when their files change (checked at most once per
+second, per handshake), so a rotated Kubernetes Secret takes effect without a
+restart; an invalid replacement is ignored and the last good pair stays in
+service. Startup fails fast on unreadable certificates or CA bundles. The
+container healthcheck probes over HTTPS and accepts only the exact certificate
+the gateway is configured to serve.
+
+```sh
+./scripts/gen-dev-certs.sh            # throwaway CA + server/client certs in deploy/tls/dev
+docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
+CURL_CA_BUNDLE=deploy/tls/dev/ca.pem BASE_URL=https://localhost:8443 \
+  EXPECT_UPSTREAM_MTLS=1 ./scripts/smoke-test.sh
+```
+
+`internal/tlsconfig` tests (in-memory CAs, no fixtures) cover: a successful
+TLS 1.3 mTLS exchange; rejection of upstream certificates that are
+self-signed, issued by another CA, or for the wrong hostname; no fallback to
+system roots; the server rejecting a missing, self-signed, or foreign-CA client
+certificate; refusal of TLS 1.1 and plaintext; and certificate hot-reload,
+including keeping the old pair when a rotation is broken. Proxy tests confirm a
+502 (and zero upstream requests) when the upstream is an impostor.
 
 ### Hot-reloadable proxy feature flags
 

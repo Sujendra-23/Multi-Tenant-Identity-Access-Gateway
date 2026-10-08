@@ -130,3 +130,25 @@ func TestFeatureFlagsConfiguration(t *testing.T) {
 		}
 	}
 }
+
+func TestLoad_TLSSettings(t *testing.T) {
+	for name, tc := range map[string]struct {
+		env map[string]string
+		ok  bool
+	}{
+		"cert without key":         {map[string]string{"TLS_CERT_FILE": "c.pem"}, false},
+		"cert and key":             {map[string]string{"TLS_CERT_FILE": "c.pem", "TLS_KEY_FILE": "k.pem"}, true},
+		"client cert without CA":   {map[string]string{"UPSTREAM_CLIENT_CERT_FILE": "c.pem", "UPSTREAM_CLIENT_KEY_FILE": "k.pem", "UPSTREAMS": "demo=https://u:8443"}, false},
+		"client cert without key":  {map[string]string{"UPSTREAM_CA_FILE": "ca.pem", "UPSTREAM_CLIENT_CERT_FILE": "c.pem", "UPSTREAMS": "demo=https://u:8443"}, false},
+		"mtls with http upstream":  {map[string]string{"UPSTREAM_CA_FILE": "ca.pem", "UPSTREAMS": "demo=http://u:8090"}, false},
+		"mtls with https upstream": {map[string]string{"UPSTREAM_CA_FILE": "ca.pem", "UPSTREAM_CLIENT_CERT_FILE": "c.pem", "UPSTREAM_CLIENT_KEY_FILE": "k.pem", "UPSTREAMS": "demo=https://u:8443"}, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			withEnv(t, tc.env)
+			_, err := Load()
+			if (err == nil) != tc.ok {
+				t.Fatalf("Load() error = %v, want ok=%v", err, tc.ok)
+			}
+		})
+	}
+}

@@ -5,7 +5,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
@@ -25,6 +27,7 @@ import (
 	"github.com/sujendra/identity-gateway/internal/observability"
 	"github.com/sujendra/identity-gateway/internal/store/postgres"
 	"github.com/sujendra/identity-gateway/internal/store/redisstore"
+	"github.com/sujendra/identity-gateway/internal/tlsconfig"
 )
 
 func main() {
@@ -61,14 +64,36 @@ func runHealthcheck() int {
 	// Listen call — with no host part, that resolves to every interface, none
 	// of which is dialable as-is, so an omitted host is filled in as localhost.
 	// When it already names a host, that is used unchanged.
-	var url string
+	host := addr
 	if strings.HasPrefix(addr, ":") {
-		url = fmt.Sprintf("http://localhost%s/healthz", addr)
-	} else {
-		url = fmt.Sprintf("http://%s/healthz", addr)
+		host = "localhost" + addr
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	url := fmt.Sprintf("http://%s/healthz", host)
+
+	// With TLS on, the probe dials https and accepts only the exact leaf
+	// certificate this process is configured to serve. That pins the check to
+	// our own certificate without needing the CA or a "localhost" SAN.
+	if certFile := os.Getenv("TLS_CERT_FILE"); certFile != "" {
+		pair, err := tls.LoadX509KeyPair(certFile, os.Getenv("TLS_KEY_FILE"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "healthcheck: load certificate:", err)
+			return 1
+		}
+		want := pair.Certificate[0]
+		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: true, // replaced by the exact-match check below
+			VerifyConnection: func(cs tls.ConnectionState) error {
+				if len(cs.PeerCertificates) == 0 || !bytes.Equal(cs.PeerCertificates[0].Raw, want) {
+					return errors.New("server certificate does not match TLS_CERT_FILE")
+				}
+				return nil
+			},
+		}}
+		url = fmt.Sprintf("https://%s/healthz", host)
 	}
 
-	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "healthcheck: request failed:", err)
@@ -89,7 +114,25 @@ func run() error {
 	}
 
 	log := observability.NewLogger(cfg.Env)
-	log.Info("starting identity gateway", "env", cfg.Env, "http_addr", cfg.HTTPAddr)
+	log.Info("starting identity gateway", "env", cfg.Env, "http_addr", cfg.HTTPAddr, "tls", cfg.TLSEnabled(), "upstream_mtls", cfg.UpstreamCAFile != "")
+
+	// TLS material is validated before anything else starts, so a bad
+	// certificate or CA path fails fast instead of on the first request.
+	var serverTLS, upstreamTLS *tls.Config
+	if cfg.TLSEnabled() {
+		if serverTLS, err = tlsconfig.Server(tlsconfig.ServerOptions{CertFile: cfg.TLSCertFile, KeyFile: cfg.TLSKeyFile}); err != nil {
+			return fmt.Errorf("api tls: %w", err)
+		}
+	}
+	if cfg.UpstreamCAFile != "" {
+		upstreamTLS, err = tlsconfig.Client(tlsconfig.ClientOptions{
+			CAFile: cfg.UpstreamCAFile, CertFile: cfg.UpstreamClientCertFile,
+			KeyFile: cfg.UpstreamClientKeyFile, ServerName: cfg.UpstreamServerName,
+		})
+		if err != nil {
+			return fmt.Errorf("upstream mtls: %w", err)
+		}
+	}
 
 	// Root context cancelled on SIGINT/SIGTERM, which drives every background
 	// loop and the graceful HTTP shutdown below.
@@ -208,7 +251,7 @@ func run() error {
 	}
 
 	router := httpapi.NewRouter(httpapi.Deps{
-		DistributedFlags: distributedFlags, Flags: flags, Config: cfg, Log: log, Metrics: metrics, DB: db, Cache: cache,
+		DistributedFlags: distributedFlags, Flags: flags, Config: cfg, UpstreamTLS: upstreamTLS, Log: log, Metrics: metrics, DB: db, Cache: cache,
 		Keyring: keyring, Issuer: issuer, AuthSvc: authSvc,
 		Evaluator: evaluator, RiskEngine: riskEngine, Auditor: auditor,
 		Tenants: tenants, Users: users, Roles: roles, Sessions: sessions, Audit: auditRepo,
@@ -222,14 +265,22 @@ func run() error {
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		TLSConfig:         serverTLS,
 	}
 
 	metricsSrv := observability.NewMetricsServer(cfg.MetricsAddr, metrics)
 
 	serveErr := make(chan error, 2)
 	go func() {
-		log.Info("http server listening", "addr", cfg.HTTPAddr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Info("http server listening", "addr", cfg.HTTPAddr, "tls", serverTLS != nil)
+		var err error
+		if serverTLS != nil {
+			// Certificates come from TLSConfig.GetCertificate (hot-reloaded).
+			err = srv.ListenAndServeTLS("", "")
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- fmt.Errorf("api server: %w", err)
 		}
 	}()

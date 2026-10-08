@@ -89,8 +89,11 @@ services:
     environment:
       ADDR: ":8090"
       GATEWAY_JWKS_URL: "http://gateway:8080/.well-known/jwks.json"
+    # Wait for a healthy gateway so the first JWKS fetch succeeds instead of
+    # leaving forwarded tokens unverifiable until the 30s refresh.
     depends_on:
-      - gateway
+      gateway:
+        condition: service_healthy
 
   seed:
     build:

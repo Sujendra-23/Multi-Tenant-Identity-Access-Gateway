@@ -13,11 +13,17 @@
 //     verifies the forwarded access token itself. It does not need to trust the
 //     network at all for this half — a forged X-Gateway-User-Id header without
 //     a token that actually verifies is caught here.
+//
+// With TLS_CERT_FILE, TLS_KEY_FILE and TLS_CLIENT_CA_FILE set, the service
+// also serves HTTPS and requires a client certificate from that CA (mutual
+// TLS), so the gateway proves which service is calling at the transport layer
+// as well. GATEWAY_CA_FILE pins the CA used to fetch the JWKS over https.
 package main
 
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -29,6 +35,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/sujendra/identity-gateway/internal/tlsconfig"
 )
 
 type jwk struct {
@@ -49,11 +56,12 @@ type keySet struct {
 	mu      sync.RWMutex
 	keys    map[string]ed25519.PublicKey
 	jwksURL string
+	client  *http.Client
 	log     *slog.Logger
 }
 
-func newKeySet(jwksURL string, log *slog.Logger) *keySet {
-	return &keySet{keys: map[string]ed25519.PublicKey{}, jwksURL: jwksURL, log: log}
+func newKeySet(jwksURL string, client *http.Client, log *slog.Logger) *keySet {
+	return &keySet{keys: map[string]ed25519.PublicKey{}, jwksURL: jwksURL, client: client, log: log}
 }
 
 func (k *keySet) refresh(ctx context.Context) error {
@@ -61,7 +69,7 @@ func (k *keySet) refresh(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := k.client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -143,7 +151,16 @@ func main() {
 	addr := getenv("ADDR", ":8090")
 	jwksURL := getenv("GATEWAY_JWKS_URL", "http://gateway:8080/.well-known/jwks.json")
 
-	ks := newKeySet(jwksURL, log)
+	jwksClient := &http.Client{Timeout: 10 * time.Second}
+	if caFile := os.Getenv("GATEWAY_CA_FILE"); caFile != "" {
+		pool, err := tlsconfig.LoadCAPool(caFile)
+		if err != nil {
+			log.Error("load gateway CA", "error", err)
+			os.Exit(1)
+		}
+		jwksClient.Transport = &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}}
+	}
+	ks := newKeySet(jwksURL, jwksClient, log)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go ks.run(ctx)
@@ -170,6 +187,11 @@ func main() {
 			},
 		}
 
+		// Under mTLS the verified client certificate names the calling service.
+		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+			resp["mtls_client"] = r.TLS.PeerCertificates[0].Subject.CommonName
+		}
+
 		auth := r.Header.Get("Authorization")
 		const prefix = "Bearer "
 		if strings.HasPrefix(auth, prefix) {
@@ -190,8 +212,25 @@ func main() {
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
-	log.Info("demo upstream listening", "addr", addr, "jwks_url", jwksURL)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	var err error
+	if certFile := os.Getenv("TLS_CERT_FILE"); certFile != "" {
+		srv.TLSConfig, err = tlsconfig.Server(tlsconfig.ServerOptions{
+			CertFile: certFile, KeyFile: os.Getenv("TLS_KEY_FILE"),
+			ClientCAFile: os.Getenv("TLS_CLIENT_CA_FILE"), MinVersion: tls.VersionTLS13,
+		})
+		if err != nil {
+			log.Error("tls config", "error", err)
+			os.Exit(1)
+		}
+		log.Info("demo upstream listening", "addr", addr, "jwks_url", jwksURL, "tls", true,
+			"client_certs_required", srv.TLSConfig.ClientCAs != nil)
+		err = srv.ListenAndServeTLS("", "")
+	} else {
+		log.Info("demo upstream listening", "addr", addr, "jwks_url", jwksURL)
+		err = srv.ListenAndServe()
+	}
+	if err != nil {
 		log.Error("server exited", "error", err)
 		os.Exit(1)
 	}

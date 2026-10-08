@@ -56,7 +56,7 @@ func TestFeatureFlagsAdminPropagatesToProxy(t *testing.T) {
 	a.Put("/v1/admin/feature-flags", admin.Put)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }))
 	defer upstream.Close()
-	proxy, err := NewProxyHandler(map[string]string{"demo": upstream.URL}, log, f2)
+	proxy, err := NewProxyHandler(map[string]string{"demo": upstream.URL}, nil, log, f2)
 	if err != nil {
 		t.Fatal(err)
 	}

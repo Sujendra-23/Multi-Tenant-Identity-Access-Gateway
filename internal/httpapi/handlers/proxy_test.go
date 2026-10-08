@@ -27,7 +27,7 @@ func TestProxyFeatureFlagReload(t *testing.T) {
 	}))
 	defer upstream.Close()
 	flags := &featureflags.Flags{}
-	h, err := NewProxyHandler(map[string]string{"demo": upstream.URL}, slog.Default(), flags)
+	h, err := NewProxyHandler(map[string]string{"demo": upstream.URL}, nil, slog.Default(), flags)
 	if err != nil {
 		t.Fatal(err)
 	}
