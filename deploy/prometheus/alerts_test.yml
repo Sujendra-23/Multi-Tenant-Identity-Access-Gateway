@@ -1,0 +1,387 @@
+# Unit tests for alerts.yml. Run with scripts/check-alerts.sh (or
+# `promtool test rules deploy/prometheus/alerts_test.yml`).
+#
+# These feed hand-built series into the rules, so they prove the PromQL does
+# what the comments say. They do not prove the gateway emits series shaped like
+# these in production; that is checked separately by running the gateway.
+#
+# Series syntax: "a+bxN" starts at a and adds b per 1m step, N times. 30 per
+# minute is 0.5 events per second.
+
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # --- login failure spike ------------------------------------------------------------
+  - name: login spike fires for the attacked tenant only
+    interval: 1m
+    input_series:
+      - series: 'gateway_auth_attempts_total{outcome="unknown_user", tenant="acme"}'
+        values: '0+30x30'
+      - series: 'gateway_auth_attempts_total{outcome="success", tenant="acme"}'
+        values: '0+3x30'
+      - series: 'gateway_auth_attempts_total{outcome="success", tenant="globex"}'
+        values: '0+120x30'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: GatewayLoginFailureSpike
+        exp_alerts: []   # still pending: `for: 5m` not yet satisfied
+      - eval_time: 15m
+        alertname: GatewayLoginFailureSpike
+        exp_alerts:
+          - exp_labels: {severity: warning, tenant: acme}
+            exp_annotations:
+              summary: "Login failure spike for tenant acme"
+              description: "Tenant acme is seeing 0.50 failed logins per second, most of its login attempts, for 5 minutes. Credential stuffing, a misconfigured client, or a bad deploy that rejects valid credentials."
+              runbook_url: "docs/runbooks/login-failure-spike.md"
+
+  - name: login spike ignores a busy tenant with a normal failure rate
+    interval: 1m
+    input_series:
+      # 0.3 failures/s is above the absolute floor, but only ~6% of 5 attempts/s.
+      - series: 'gateway_auth_attempts_total{outcome="bad_password", tenant="acme"}'
+        values: '0+18x30'
+      - series: 'gateway_auth_attempts_total{outcome="success", tenant="acme"}'
+        values: '0+300x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: GatewayLoginFailureSpike
+        exp_alerts: []
+
+  - name: login spike ignores a trickle of failures
+    interval: 1m
+    input_series:
+      # Every attempt fails, but at 0.05/s, below the 0.2/s floor.
+      - series: 'gateway_auth_attempts_total{outcome="bad_password", tenant="acme"}'
+        values: '0+3x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: GatewayLoginFailureSpike
+        exp_alerts: []
+
+  - name: locked-account attempts count as failures, suspended-tenant ones do not
+    interval: 1m
+    input_series:
+      - series: 'gateway_auth_attempts_total{outcome="locked", tenant="acme"}'
+        values: '0+30x30'
+      - series: 'gateway_auth_attempts_total{outcome="tenant_suspended", tenant="globex"}'
+        values: '0+600x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GatewayLoginFailureSpike
+        exp_alerts:
+          - exp_labels: {severity: warning, tenant: acme}
+            exp_annotations:
+              summary: "Login failure spike for tenant acme"
+              description: "Tenant acme is seeing 0.50 failed logins per second, most of its login attempts, for 5 minutes. Credential stuffing, a misconfigured client, or a bad deploy that rejects valid credentials."
+              runbook_url: "docs/runbooks/login-failure-spike.md"
+
+  # --- rate limiting ------------------------------------------------------------------
+  - name: login rate limiter surge fires, other dimensions do not trigger it
+    interval: 1m
+    input_series:
+      - series: 'gateway_rate_limit_rejections_total{dimension="login", tenant="acme"}'
+        values: '0+60x30'
+      - series: 'gateway_rate_limit_rejections_total{dimension="ip", tenant="none"}'
+        values: '0+600x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GatewayLoginRateLimitSurge
+        exp_alerts:
+          - exp_labels: {severity: warning, tenant: acme}
+            exp_annotations:
+              summary: "Login rate limiter is rejecting requests for tenant acme"
+              description: "1.00 login requests per second are being rejected by the login rate limiter for tenant acme. Note the limiter fails open when Redis is unreachable, so silence here during a Redis outage means nothing."
+              runbook_url: "docs/runbooks/login-failure-spike.md#mitigations"
+
+  - name: general rate-limit rejections are ignored when traffic dwarfs them
+    interval: 1m
+    input_series:
+      # 5 rejections/s, but total traffic is 1000 requests/s (0.5%).
+      - series: 'gateway_rate_limit_rejections_total{dimension="ip", tenant="none"}'
+        values: '0+300x30'
+      - series: 'gateway_http_requests_total{method="GET", route="/v1/users/", status="200", tenant="none"}'
+        values: '0+60000x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GatewayRateLimitRejectionsHigh
+        exp_alerts: []
+
+  - name: general rate-limit rejections fire at a high share of traffic
+    interval: 1m
+    input_series:
+      # 5 rejections/s against 15 requests/s of other traffic (25% share).
+      - series: 'gateway_rate_limit_rejections_total{dimension="ip", tenant="none"}'
+        values: '0+300x30'
+      - series: 'gateway_http_requests_total{method="GET", route="/v1/users/", status="200", tenant="none"}'
+        values: '0+900x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GatewayRateLimitRejectionsHigh
+        exp_alerts:
+          - exp_labels: {severity: warning, dimension: ip}
+            exp_annotations:
+              summary: "Rate limiter (ip) is rejecting a large share of traffic"
+              description: "The ip rate limit is rejecting 5.00 requests per second, over 10% of all traffic, for 5 minutes. Either an abusive client or limits set too low for real load."
+              runbook_url: "docs/runbooks/login-failure-spike.md#mitigations"
+
+  - name: refresh token reuse threshold
+    interval: 1m
+    input_series:
+      - series: 'gateway_token_refresh_total{outcome="reuse_detected"}'
+        values: '0 0 0 1 2 3 4 5 5 5'
+      - series: 'gateway_token_refresh_total{outcome="success"}'
+        values: '0+1000x9'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: GatewayRefreshTokenReuseDetected
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: GatewayRefreshTokenReuseDetected
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: "Refresh-token reuse detected 5 times in 15 minutes"
+              description: "Replayed refresh tokens force the session family to be revoked. Check the audit log for auth.refresh_reuse_detected to see whether it is one user with a buggy client or many users."
+              runbook_url: "docs/runbooks/login-failure-spike.md#mitigations"
+
+  # --- availability and errors --------------------------------------------------------
+  - name: 5xx ratio fires per route and ignores 4xx, trickles and readiness
+    interval: 1m
+    input_series:
+      # login: 10% 5xx at 5 req/s -> fires
+      - series: 'gateway_http_requests_total{method="POST", route="/v1/auth/login", status="500", tenant="none"}'
+        values: '0+30x30'
+      - series: 'gateway_http_requests_total{method="POST", route="/v1/auth/login", status="200", tenant="none"}'
+        values: '0+270x30'
+      # users: 50% of requests are 4xx -> quiet
+      - series: 'gateway_http_requests_total{method="GET", route="/v1/users/", status="403", tenant="none"}'
+        values: '0+300x30'
+      - series: 'gateway_http_requests_total{method="GET", route="/v1/users/", status="200", tenant="none"}'
+        values: '0+300x30'
+      # roles: all 5xx but only 0.05 req/s -> below the traffic floor
+      - series: 'gateway_http_requests_total{method="GET", route="/v1/roles/", status="500", tenant="none"}'
+        values: '0+3x30'
+      # readyz: 503s are handled by GatewayNotReady, not this rule
+      - series: 'gateway_http_requests_total{method="GET", route="/readyz", status="503", tenant="none"}'
+        values: '0+60x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GatewayHigh5xxRatio
+        exp_alerts:
+          - exp_labels: {severity: critical, route: /v1/auth/login}
+            exp_annotations:
+              summary: "More than 5% of /v1/auth/login requests are failing with 5xx"
+              description: "/v1/auth/login has returned 5xx for 10% of requests over 5 minutes (and carries more than 0.1 req/s). For /v1/proxy/* these include errors from the upstream service. Distinguish a bad deploy from a dependency outage before acting."
+              runbook_url: "docs/runbooks/login-failure-spike.md#triage-what-kind-of-spike-is-this"
+
+  - name: p99 latency alert
+    interval: 1m
+    input_series:
+      # slow route: 5% of 10 req/s take 1-2.5s -> p99 about 2.2s
+      - series: 'gateway_http_request_duration_seconds_bucket{method="GET", route="/v1/users/", le="0.5"}'
+        values: '0+570x40'
+      - series: 'gateway_http_request_duration_seconds_bucket{method="GET", route="/v1/users/", le="1"}'
+        values: '0+570x40'
+      - series: 'gateway_http_request_duration_seconds_bucket{method="GET", route="/v1/users/", le="2.5"}'
+        values: '0+600x40'
+      - series: 'gateway_http_request_duration_seconds_bucket{method="GET", route="/v1/users/", le="+Inf"}'
+        values: '0+600x40'
+      - series: 'gateway_http_request_duration_seconds_count{method="GET", route="/v1/users/"}'
+        values: '0+600x40'
+      # fast route
+      - series: 'gateway_http_request_duration_seconds_bucket{method="GET", route="/v1/roles/", le="0.5"}'
+        values: '0+600x40'
+      - series: 'gateway_http_request_duration_seconds_bucket{method="GET", route="/v1/roles/", le="1"}'
+        values: '0+600x40'
+      - series: 'gateway_http_request_duration_seconds_bucket{method="GET", route="/v1/roles/", le="+Inf"}'
+        values: '0+600x40'
+      - series: 'gateway_http_request_duration_seconds_count{method="GET", route="/v1/roles/"}'
+        values: '0+600x40'
+      # slow proxy route is excluded (its latency is the upstream's)
+      - series: 'gateway_http_request_duration_seconds_bucket{method="GET", route="/v1/proxy/{service}/*", le="1"}'
+        values: '0+0x40'
+      - series: 'gateway_http_request_duration_seconds_bucket{method="GET", route="/v1/proxy/{service}/*", le="+Inf"}'
+        values: '0+600x40'
+      - series: 'gateway_http_request_duration_seconds_count{method="GET", route="/v1/proxy/{service}/*"}'
+        values: '0+600x40'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: GatewayHighLatencyP99
+        exp_alerts:
+          - exp_labels: {severity: warning, route: /v1/users/}
+            exp_annotations:
+              summary: "p99 latency above 1s on /v1/users/"
+              description: "p99 request latency on /v1/users/ has been 2.2s for 10 minutes. Slow Postgres or Redis calls, CPU starvation or saturation by a login flood are the usual causes."
+
+  - name: gateway down and not ready
+    interval: 1m
+    input_series:
+      - series: 'up{job="identity-gateway", instance="gw-1:9090"}'
+        values: '1 1 1 0 0 0 0 0 0 0'
+      - series: 'up{job="identity-gateway", instance="gw-2:9090"}'
+        values: '1x9'
+      - series: 'up{job="prometheus", instance="localhost:9090"}'
+        values: '0x9'
+      - series: 'gateway_http_requests_total{method="GET", route="/readyz", status="503", tenant="none", instance="gw-2:9090"}'
+        values: '0+6x9'
+      - series: 'gateway_http_requests_total{method="GET", route="/readyz", status="200", tenant="none", instance="gw-1:9090"}'
+        values: '0+6x9'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: GatewayTargetDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: identity-gateway, instance: "gw-1:9090"}
+            exp_annotations:
+              summary: "Gateway gw-1:9090 is not being scraped"
+              description: "Prometheus cannot scrape gw-1:9090 (job identity-gateway) for 2 minutes. The process is down, or its metrics listener is unreachable."
+      - eval_time: 8m
+        alertname: GatewayNotReady
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: "gw-2:9090"}
+            exp_annotations:
+              summary: "Gateway gw-2:9090 reports not ready"
+              description: "/readyz has been returning 503 on gw-2:9090 for 2 minutes: Postgres, Redis or the signing key is unavailable. Run `curl -s http://<gateway>:8080/readyz` to see which."
+              runbook_url: "docs/runbooks/login-failure-spike.md#a-dependency-outage"
+
+  # --- dependencies -------------------------------------------------------------------
+  - name: 503s on authenticated routes fire; proxy, admin and readyz 503s do not
+    interval: 1m
+    input_series:
+      - series: 'gateway_http_requests_total{method="GET", route="/v1/auth/me", status="503", tenant="none"}'
+        values: '0+30x30'
+      - series: 'gateway_http_requests_total{method="GET", route="/v1/proxy/{service}/*", status="503", tenant="none"}'
+        values: '0+600x30'
+      - series: 'gateway_http_requests_total{method="GET", route="/v1/admin/feature-flags/", status="503", tenant="none"}'
+        values: '0+600x30'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: GatewayAuthenticatedRequests503
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: GatewayAuthenticatedRequests503
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: "Authenticated requests are failing with 503"
+              description: "Gateway is answering 503 on authenticated routes at 0.50 requests per second. Redis session checks or Postgres permission lookups are failing. If gateway_authz_decisions_total{decision=\"error\"} is also rising it is Postgres; if not, Redis."
+              runbook_url: "docs/runbooks/login-failure-spike.md#a-dependency-outage"
+
+  - name: refresh, policy cache and authz error counters
+    interval: 1m
+    input_series:
+      - series: 'gateway_token_refresh_total{outcome="error"}'
+        values: '0+6x30'
+      - series: 'gateway_token_refresh_total{outcome="reuse_detected"}'
+        values: '0+0x30'
+      - series: 'gateway_policy_cache_ops_total{result="error"}'
+        values: '0+12x30'
+      - series: 'gateway_policy_cache_ops_total{result="hit"}'
+        values: '0+600x30'
+      - series: 'gateway_authz_decisions_total{decision="error", reason="evaluation_failed", tenant="acme"}'
+        values: '0+6x30'
+      - series: 'gateway_authz_decisions_total{decision="deny", reason="no_matching_grant", tenant="acme"}'
+        values: '0+600x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GatewayRefreshRotationErrors
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: "Refresh-token rotation is erroring"
+              description: "Refresh requests are failing with an unexpected error (0.10/s). The rotation script runs in Redis, so check Redis connectivity and errors."
+              runbook_url: "docs/runbooks/login-failure-spike.md#a-dependency-outage"
+      - eval_time: 15m
+        alertname: GatewayPolicyCacheErrors
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: "Permission cache reads are erroring"
+              description: "Reads of the Redis permission cache are failing at 0.20/s; the gateway falls back to Postgres for each, which adds latency and database load."
+              runbook_url: "docs/runbooks/login-failure-spike.md#a-dependency-outage"
+      - eval_time: 15m
+        alertname: GatewayAuthzEvaluationFailing
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: "Authorization decisions are failing with errors"
+              description: "Permission evaluation is erroring (0.10/s): the effective-permissions query to Postgres is failing, so users are being refused with 503 for infrastructure reasons, not policy."
+              runbook_url: "docs/runbooks/login-failure-spike.md#a-dependency-outage"
+
+  - name: healthy gateway raises nothing
+    interval: 1m
+    input_series:
+      - series: 'up{job="identity-gateway", instance="gw-1:9090"}'
+        values: '1x30'
+      - series: 'gateway_http_requests_total{method="GET", route="/v1/auth/me", status="200", tenant="none"}'
+        values: '0+600x30'
+      - series: 'gateway_http_requests_total{method="GET", route="/readyz", status="200", tenant="none"}'
+        values: '0+6x30'
+      - series: 'gateway_auth_attempts_total{outcome="success", tenant="acme"}'
+        values: '0+60x30'
+      - series: 'gateway_auth_attempts_total{outcome="bad_password", tenant="acme"}'
+        values: '0+2x30'
+      - series: 'gateway_audit_events_dropped_total'
+        values: '0x30'
+      - series: 'gateway_audit_buffer_depth'
+        values: '12x30'
+      - series: 'gateway_signing_keys'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: GatewayTargetDown
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: GatewayLoginFailureSpike
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: GatewayHigh5xxRatio
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: GatewayAuditEventsDropped
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: GatewayAuditBufferNearlyFull
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: GatewayNoSigningKeys
+        exp_alerts: []
+
+  - name: audit drops, a nearly full audit buffer and missing signing keys
+    interval: 1m
+    input_series:
+      - series: 'gateway_audit_events_dropped_total'
+        values: '0 0 0 0 7 7 7 7 7 7 7 7 7 7 7 7 7 7 7'
+      - series: 'gateway_audit_buffer_depth{instance="gw-1:9090"}'
+        values: '4000x30'
+      - series: 'gateway_signing_keys{instance="gw-1:9090"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: GatewayAuditEventsDropped
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: "Audit events were dropped"
+              description: "7 audit events were lost in the last 10 minutes (buffer full or Postgres write failed). The audit chain has a gap for those events."
+              runbook_url: "docs/runbooks/login-failure-spike.md#a-dependency-outage"
+      - eval_time: 18m
+        alertname: GatewayAuditEventsDropped
+        exp_alerts: []   # the increase has aged out of the 10m window
+      - eval_time: 10m
+        alertname: GatewayAuditBufferNearlyFull
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: "gw-1:9090"}
+            exp_annotations:
+              summary: "Audit buffer on gw-1:9090 is above 80% full"
+              description: "The audit writer is not keeping up (4000 events buffered). Events will be dropped once it fills; Postgres is slow or failing, or the event rate has outgrown the buffer."
+              runbook_url: "docs/runbooks/login-failure-spike.md#a-dependency-outage"
+      - eval_time: 10m
+        alertname: GatewayNoSigningKeys
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: "gw-1:9090"}
+            exp_annotations:
+              summary: "Gateway gw-1:9090 trusts no signing keys"
+              description: "No signing keys are loaded, so access tokens cannot be issued or verified. The key table in Postgres is empty or unreadable."

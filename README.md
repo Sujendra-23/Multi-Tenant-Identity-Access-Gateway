@@ -19,6 +19,7 @@ stack to watch it happen.
 - [Authentication flows](#authentication-flows)
 - [Seeing it work](#seeing-it-work)
 - [Kubernetes](#kubernetes)
+- [Alerts and on-call runbook](#alerts-and-on-call-runbook)
 - [Testing](#testing)
 - [API reference](#api-reference)
 - [Configuration reference](#configuration-reference)
@@ -37,7 +38,7 @@ stack to watch it happen.
 | TLS and mutual TLS | HTTPS on the API (TLS 1.2+, AEAD suites only) and mTLS from the proxy to upstreams, pinned to an internal CA with no fallback to system roots; certificates hot-reload on rotation (`internal/tlsconfig/`). |
 | Hot-reloadable tenant feature flags | Stable percentage rollouts and tenant overrides; local `SIGHUP` reloads or revision-checked admin updates propagated through Redis pub/sub with periodic reconciliation (`internal/featureflags/`). |
 | Kubernetes/EKS | Full manifest set in `deploy/k8s/`, validated end-to-end against a real cluster (see [Kubernetes](#kubernetes)). |
-| Prometheus/Grafana | `internal/observability/`, dashboard at `deploy/grafana/dashboards/identity-gateway.json`. |
+| Prometheus/Grafana | `internal/observability/`, dashboard at `deploy/grafana/dashboards/identity-gateway.json`, alert rules at `deploy/prometheus/alerts.yml` and an on-call [runbook](docs/runbooks/login-failure-spike.md). |
 
 ## Architecture
 
@@ -423,6 +424,20 @@ validated and planned offline (`terraform validate`, and `terraform plan` with
 mock credentials: 46 resources to add) — it has never been applied to an AWS
 account, and the cluster in "validated end-to-end against a real cluster"
 above is the local `kind` cluster, not EKS.**
+
+## Alerts and on-call runbook
+
+`deploy/prometheus/alerts.yml` holds 15 Prometheus alert rules built only on metrics the gateway already exports: availability (`up`, `/readyz`), 5xx ratio and p99 latency per route, login-failure spikes per tenant, rate-limiter surges, refresh-token reuse, and dependency trouble (audit drops and backlog, permission-lookup and session-check failures, refresh-rotation errors, missing signing keys). Compose mounts the file into Prometheus (`:9091`), and its Alerts tab shows rule state. **There is no Alertmanager in this repo**, so nothing is routed to a pager until you add one.
+
+```bash
+./scripts/check-alerts.sh   # promtool check + 15 unit tests on synthetic series (uses Docker if promtool is not installed)
+```
+
+The unit tests prove the rules do what their comments say on hand-built series. The only test against real traffic so far was a local run: one gateway with Docker Postgres and Redis, a scripted login attack from one address, a Redis outage and a killed process; the results, including what did *not* get exercised, are at the end of the runbook. Thresholds come from the code's defaults, not production data, and are expected to need tuning.
+
+There are no Postgres or Redis client metrics, so the dependency alerts infer trouble from the gateway's own error outcomes. Two registered metrics (`gateway_token_verify_failures_total`, `gateway_active_sessions`) are never written to, and the `tenant` label on `gateway_http_requests_total` is always `none`; the runbook lists these and works around them.
+
+**[Runbook: login failure spike](docs/runbooks/login-failure-spike.md)** explains how to tell credential stuffing from a bad deploy from a dependency outage, with the PromQL and audit-log SQL to run, the mitigations that exist (and the ones that do not), escalation, and post-incident steps.
 
 ## Testing
 
@@ -877,7 +892,11 @@ internal/
 deploy/
   postgres-init/  The restricted-role script — read this second.
   k8s/            Kubernetes manifests, applied in numeric order.
-  prometheus/, grafana/  Scrape config, dashboard, provisioning.
+  prometheus/, grafana/  Scrape config, alert rules (+ unit tests), dashboard, provisioning.
+docs/
+  runbooks/       On-call runbooks (login failure spike).
+  diagrams/       Mermaid sources for the auth flows.
 scripts/
   smoke-test.sh   Automated end-to-end walkthrough against a running stack.
+  check-alerts.sh Validates and unit-tests the Prometheus alert rules.
 ```
