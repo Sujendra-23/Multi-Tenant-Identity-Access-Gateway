@@ -1,0 +1,124 @@
+name: Safe deployment
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: safe-deployment-${{ github.ref }}
+  # Let an in-flight rollout finish its rollback/cleanup before the next run.
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres_bootstrap
+          POSTGRES_PASSWORD: ci-bootstrap-password
+          POSTGRES_DB: gateway_test
+          GATEWAY_APP_PASSWORD: ci-app-password
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U postgres_bootstrap -d gateway_test"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+      redis:
+        image: redis:7-alpine
+        ports: [6379:6379]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      POSTGRES_TEST_DSN: postgres://gateway_app:ci-app-password@localhost:5432/gateway_test?sslmode=disable
+      POSTGRES_TEST_ADMIN_DSN: postgres://postgres_bootstrap:ci-bootstrap-password@localhost:5432/gateway_test?sslmode=disable
+      REDIS_TEST_ADDR: localhost:6379
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+      - name: Create the restricted database role using the deployment init script
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: docker exec -i "$POSTGRES_CONTAINER" sh -s < deploy/postgres-init/01-app-role.sh
+      - name: Vet, race-test (including Postgres and Redis), and build all binaries
+        run: |
+          go vet ./...
+          go test -race -count=1 -timeout=5m ./...
+          go build ./...
+          bash -n scripts/ci/build-images.sh scripts/ci/setup-kind.sh
+          python3 -B -m unittest discover -s scripts/ci -p 'test_*.py'
+
+  kind-rollout:
+    needs: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      KIND_CLUSTER: gateway-ci
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+      - name: Install pinned kind
+        run: go install sigs.k8s.io/kind@v0.31.0
+      - name: Generate an ephemeral operator key
+        run: |
+          key=$(openssl rand -hex 32)
+          echo "::add-mask::$key"
+          printf 'BOOTSTRAP_KEY=%s\n' "$key" >> "$GITHUB_ENV"
+          printf 'KUBECONFIG=%s/gateway-ci.kubeconfig\nCI_ARTIFACTS=%s/gateway-ci-artifacts\n' "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Build candidate, previous-commit baseline, and upstream images
+        run: bash scripts/ci/build-images.sh
+      - name: Create kind and verify the baseline is ready
+        run: bash scripts/ci/setup-kind.sh
+      - name: Prove a failed smoke test restores the image and flag snapshot
+        run: |
+          if python3 scripts/ci/rollout.py --inject-smoke-failure --report "$CI_ARTIFACTS/rollback.json"; then
+            echo 'Expected the injected smoke failure to fail the deployment' >&2
+            exit 1
+          fi
+          python3 - "$CI_ARTIFACTS/rollback.json" <<'PY'
+          import json, sys
+          with open(sys.argv[1]) as f:
+              result = json.load(f)
+          assert result['result'] == 'rolled_back', result
+          assert result['failed_stage'] == 10, result
+          assert result['injected_failure'] is True, result
+          PY
+      - name: Roll out 0 → 10 → 50 → 100 percent and run the full smoke suite
+        run: python3 scripts/ci/rollout.py --report "$CI_ARTIFACTS/rollout.json"
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          mkdir -p "$CI_ARTIFACTS"
+          kubectl --context "kind-$KIND_CLUSTER" -n identity-gateway get pods,deployments,replicasets -o wide > "$CI_ARTIFACTS/resources.txt" 2>&1 || true
+          kubectl --context "kind-$KIND_CLUSTER" -n identity-gateway get events --sort-by=.lastTimestamp > "$CI_ARTIFACTS/events.txt" 2>&1 || true
+          kubectl --context "kind-$KIND_CLUSTER" -n identity-gateway logs -l app=gateway --all-containers --prefix --tail=300 > "$CI_ARTIFACTS/gateway.log" 2>&1 || true
+          kind export logs --name "$KIND_CLUSTER" "$CI_ARTIFACTS/kind" || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: kind-rollout-diagnostics
+          path: ${{ runner.temp }}/gateway-ci-artifacts
+          retention-days: 7
+      - name: Delete the ephemeral cluster
+        if: always()
+        run: kind delete cluster --name "$KIND_CLUSTER"

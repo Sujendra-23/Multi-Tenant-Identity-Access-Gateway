@@ -19,6 +19,7 @@ stack to watch it happen.
 - [Authentication flows](#authentication-flows)
 - [Seeing it work](#seeing-it-work)
 - [Kubernetes](#kubernetes)
+- [Safe deployment CI](#safe-deployment-ci)
 - [Testing](#testing)
 - [API reference](#api-reference)
 - [Configuration reference](#configuration-reference)
@@ -423,6 +424,72 @@ validated and planned offline (`terraform validate`, and `terraform plan` with
 mock credentials: 46 resources to add) — it has never been applied to an AWS
 account, and the cluster in "validated end-to-end against a real cluster"
 above is the local `kind` cluster, not EKS.**
+
+## Safe deployment CI
+
+[`.github/workflows/safe-deployment.yml`](.github/workflows/safe-deployment.yml)
+runs on pull requests, pushes to `main`, and manual dispatch. It needs no
+repository secrets or registry credentials: each run builds local images and
+creates its own disposable kind cluster.
+
+1. Vet, race-test, and build every Go package. Real Postgres and Redis service
+   containers enable the integration tests, including RLS, flag propagation,
+   and refresh-token reuse detection. The database role is created with the same
+   restricted-role init script used by deployments. Python regression tests
+   cover deployment failures, uncertain flag writes, and rollback failures.
+2. Build images tagged by commit SHA for the candidate gateway and upstream,
+   plus a separate gateway baseline from the previous commit (`HEAD^`; for a
+   pull-request merge checkout, this is its base parent). Load all three into
+   kind and apply the existing Kubernetes manifests. Only this CI cluster's
+   ConfigMap enables the Redis flag backend, one-second reconciliation, and
+   additional login capacity for smoke probes.
+3. Verify the baseline before changing anything. Save its exact gateway image
+   and complete shared flag snapshot, close proxy access at 0%, deploy the
+   candidate, then advance `rollout_percent` through **10 → 50 → 100** using
+   the revision-checked admin API (`GET` + `PUT` with `If-Match`).
+4. At every stage, probe **each gateway replica** with authenticated tenants
+   selected from both sides of the stable SHA-256 percentage boundary. Enabled
+   tenants must reach the upstream with an independently verified JWT; excluded
+   tenants must receive `503 feature_disabled`. At 100%, run the existing full
+   smoke suite for RBAC, step-up, token rotation/replay, proxying, and audit
+   integrity.
+5. A failed flag update, rollout wait, or smoke test stops promotion. Attempt to
+   close proxy access, restore the saved image, restore the **entire** saved flag
+   configuration (including overrides), and smoke-test the restored baseline.
+   The deployment still exits nonzero after a successful rollback. Every CI run
+   first rehearses this path by deliberately probing an unconfigured upstream
+   at 10%, asserts verified rollback, then performs the normal rollout.
+
+The workflow uploads rollout reports, gateway logs, events, and kind diagnostics
+for seven days and deletes the cluster even on failure. Runs for the same ref
+queue instead of cancelling an active deployment. Actions are pinned to commit
+SHAs, the kind node image is pinned to a digest, and token permissions are
+`contents: read`.
+
+**Scope:** these flags gate proxy access by tenant; they do not split traffic
+between old and new gateway images. This is a deployment/rollback rehearsal in
+a fresh cluster, not a production deployment or a persistent release history.
+The previous commit must build and pass baseline smoke checks. Database
+migrations are not undone; image rollback requires migrations compatible with
+both versions. kind's default CNI does not enforce NetworkPolicy; upstream JWT
+verification is exercised, while network-policy enforcement needs a suitable
+CNI in a separate environment.
+
+To reproduce locally (Docker, Go, kind v0.31.0, kubectl, Python 3, and OpenSSL):
+
+```bash
+export KIND_CLUSTER=gateway-ci-local
+export KUBECONFIG="$(mktemp)"   # isolated from your normal kubeconfig
+export CI_ARTIFACTS="$(mktemp -d)"
+export CI_IMAGE_ENV="$(mktemp)"
+export BOOTSTRAP_KEY="$(openssl rand -hex 32)"
+bash scripts/ci/build-images.sh
+set -a; source "$CI_IMAGE_ENV"; set +a
+bash scripts/ci/setup-kind.sh
+python3 scripts/ci/rollout.py --report "$CI_ARTIFACTS/rollout.json"
+# Add --inject-smoke-failure to exercise rollback (expected exit status: 1).
+kind delete cluster --name "$KIND_CLUSTER"
+```
 
 ## Testing
 
