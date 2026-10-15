@@ -1,6 +1,6 @@
 resource "aws_security_group" "redis" {
   name_prefix = "${var.name}-redis-"
-  description = "Redis for the identity gateway: ingress only from EKS nodes/pods"
+  description = "Redis for the identity gateway: ingress only from EKS and gateway Fargate tasks"
   vpc_id      = aws_vpc.this.id
   tags        = merge(local.tags, { Name = "${var.name}-redis" })
 

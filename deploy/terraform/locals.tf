@@ -1,7 +1,7 @@
 locals {
   azs = length(var.availability_zones) > 0 ? var.availability_zones : ["${var.region}a", "${var.region}b"]
 
-  # /20 subnets carved from the VPC CIDR: public, private (EKS nodes), database.
+  # /20 subnets carved from the VPC CIDR: public, private (EKS nodes and Fargate tasks), database.
   public_subnet_cidrs   = [for i, _ in local.azs : cidrsubnet(var.vpc_cidr, 4, i)]
   private_subnet_cidrs  = [for i, _ in local.azs : cidrsubnet(var.vpc_cidr, 4, i + 4)]
   database_subnet_cidrs = [for i, _ in local.azs : cidrsubnet(var.vpc_cidr, 4, i + 8)]

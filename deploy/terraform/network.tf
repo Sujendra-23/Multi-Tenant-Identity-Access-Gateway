@@ -35,7 +35,7 @@ resource "aws_subnet" "private" {
   })
 }
 
-# Database subnets have no route to the internet at all: RDS and ElastiCache
+# Database subnets have no route to the internet at all: Aurora and ElastiCache
 # only need to be reachable from inside the VPC.
 resource "aws_subnet" "database" {
   count             = length(local.azs)

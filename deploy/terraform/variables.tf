@@ -95,7 +95,7 @@ variable "enable_network_policy" {
   default     = true
 }
 
-# ---- RDS Postgres ----
+# ---- Aurora PostgreSQL ----
 
 variable "db_name" {
   description = "Initial database name (matches POSTGRES_DB in deploy/k8s/01-secrets.example.yaml)."
@@ -110,9 +110,14 @@ variable "db_master_username" {
 }
 
 variable "db_engine_version" {
-  description = "Postgres major version. Row-level security and trusted pgcrypto need >= 13."
+  description = "Aurora PostgreSQL 16 engine version; must match the aurora-postgresql16 parameter family. Verify regional availability before applying."
   type        = string
   default     = "16.4"
+
+  validation {
+    condition     = can(regex("^16\\.[0-9]+$", var.db_engine_version))
+    error_message = "db_engine_version must be an Aurora PostgreSQL 16 minor version (16.x)."
+  }
 }
 
 variable "db_instance_class" {
@@ -120,22 +125,15 @@ variable "db_instance_class" {
   default = "db.t4g.medium"
 }
 
-variable "db_allocated_storage" {
-  description = "Initial storage in GiB."
+variable "db_instance_count" {
+  description = "Aurora instances, including the writer. Two or more provides a failover replica in another AZ."
   type        = number
-  default     = 50
-}
+  default     = 2
 
-variable "db_max_allocated_storage" {
-  description = "Storage autoscaling ceiling in GiB (0 disables autoscaling)."
-  type        = number
-  default     = 200
-}
-
-variable "db_multi_az" {
-  description = "Synchronous standby in a second AZ."
-  type        = bool
-  default     = true
+  validation {
+    condition     = var.db_instance_count >= 1 && var.db_instance_count <= 16 && floor(var.db_instance_count) == var.db_instance_count
+    error_message = "db_instance_count must be an integer between 1 and 16."
+  }
 }
 
 variable "db_backup_retention_days" {
@@ -185,7 +183,7 @@ variable "redis_transit_encryption_enabled" {
     so enabling this makes the gateway unable to connect until the client gains
     a tls.Config. ElastiCache AUTH tokens also require transit encryption, so
     with this off Redis is protected by private subnets + a security group that
-    only admits the EKS nodes, not by a password.
+    only admits EKS nodes and gateway Fargate tasks, not by a password.
   EOT
   type        = bool
   default     = false
@@ -195,4 +193,21 @@ variable "tags" {
   description = "Extra tags applied to every resource."
   type        = map(string)
   default     = {}
+}
+
+# ---- Optional ECS Fargate gateway ----
+
+variable "gateway_ecs" {
+  description = "Enable the Fargate gateway by supplying an image and existing Secrets Manager ARNs. Null keeps the EKS-only compute setup. Secret values are never read by Terraform."
+  type = object({
+    image                    = string
+    postgres_dsn_secret_arn  = string
+    bootstrap_key_secret_arn = string
+    secret_kms_key_arns      = optional(list(string), [])
+    desired_count            = optional(number, 3)
+    cpu                      = optional(number, 256)
+    memory                   = optional(number, 512)
+    environment              = optional(map(string), {})
+  })
+  default = null
 }

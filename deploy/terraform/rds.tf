@@ -1,6 +1,6 @@
 resource "aws_security_group" "rds" {
   name_prefix = "${var.name}-rds-"
-  description = "Postgres for the identity gateway: ingress only from EKS nodes/pods"
+  description = "Postgres for the identity gateway: ingress only from EKS and gateway Fargate tasks"
   vpc_id      = aws_vpc.this.id
   tags        = merge(local.tags, { Name = "${var.name}-rds" })
 
@@ -23,10 +23,10 @@ resource "aws_db_subnet_group" "this" {
   tags       = local.tags
 }
 
-resource "aws_db_parameter_group" "this" {
-  name_prefix = "${var.name}-pg16-"
-  family      = "postgres16"
-  description = "Identity gateway Postgres parameters"
+resource "aws_rds_cluster_parameter_group" "this" {
+  name_prefix = "${var.name}-aurora-pg16-"
+  family      = "aurora-postgresql16"
+  description = "Identity gateway Aurora PostgreSQL parameters"
 
   # Reject plaintext connections. The gateway DSN must use sslmode=require (or
   # stricter); the default DSN in deploy/k8s/05-gateway.yaml says sslmode=disable
@@ -46,36 +46,49 @@ resource "aws_db_parameter_group" "this" {
   lifecycle { create_before_destroy = true }
 }
 
-resource "aws_db_instance" "this" {
-  identifier     = var.name
-  engine         = "postgres"
-  engine_version = var.db_engine_version
-  instance_class = var.db_instance_class
+resource "aws_rds_cluster" "this" {
+  cluster_identifier = var.name
+  engine             = "aurora-postgresql"
+  engine_mode        = "provisioned"
+  engine_version     = var.db_engine_version
 
-  db_name  = var.db_name
-  username = var.db_master_username
-  # RDS generates the master password and keeps it in Secrets Manager, so no
-  # password ever appears in Terraform variables or plan output.
+  database_name               = var.db_name
+  master_username             = var.db_master_username
   manage_master_user_password = true
+  storage_encrypted           = true
+  port                        = 5432
 
-  allocated_storage     = var.db_allocated_storage
-  max_allocated_storage = var.db_max_allocated_storage > 0 ? var.db_max_allocated_storage : null
-  storage_type          = "gp3"
-  storage_encrypted     = true
+  db_subnet_group_name            = aws_db_subnet_group.this.name
+  vpc_security_group_ids          = [aws_security_group.rds.id]
+  db_cluster_parameter_group_name = aws_rds_cluster_parameter_group.this.name
 
-  multi_az               = var.db_multi_az
-  db_subnet_group_name   = aws_db_subnet_group.this.name
-  vpc_security_group_ids = [aws_security_group.rds.id]
-  parameter_group_name   = aws_db_parameter_group.this.name
-  publicly_accessible    = false
+  backup_retention_period         = var.db_backup_retention_days
+  copy_tags_to_snapshot           = true
+  deletion_protection             = var.db_deletion_protection
+  skip_final_snapshot             = var.db_skip_final_snapshot
+  final_snapshot_identifier       = var.db_skip_final_snapshot ? null : "${var.name}-final"
+  enabled_cloudwatch_logs_exports = ["postgresql"]
 
-  backup_retention_period      = var.db_backup_retention_days
-  copy_tags_to_snapshot        = true
-  deletion_protection          = var.db_deletion_protection
-  skip_final_snapshot          = var.db_skip_final_snapshot
-  final_snapshot_identifier    = var.db_skip_final_snapshot ? null : "${var.name}-final"
+  tags = local.tags
+}
+
+# One writer plus a failover replica by default, placed in distinct AZs.
+# Aurora manages storage capacity; instance-style gp3/storage limits do not apply.
+resource "aws_rds_cluster_instance" "this" {
+  count = var.db_instance_count
+
+  identifier                   = "${var.name}-${count.index + 1}"
+  cluster_identifier           = aws_rds_cluster.this.id
+  engine                       = aws_rds_cluster.this.engine
+  engine_version               = aws_rds_cluster.this.engine_version
+  instance_class               = var.db_instance_class
+  availability_zone            = local.azs[count.index % length(local.azs)]
+  promotion_tier               = count.index
+  db_subnet_group_name         = aws_db_subnet_group.this.name
+  publicly_accessible          = false
   auto_minor_version_upgrade   = true
   performance_insights_enabled = true
+  copy_tags_to_snapshot        = true
 
   tags = local.tags
 }
